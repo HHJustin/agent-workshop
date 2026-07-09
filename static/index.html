@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Workshop</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>Agent Workshop</h2>
+                <p class="subtitle">Boss Agent 智能调度</p>
+            </div>
+            <button class="btn btn-new" onclick="newChat()">+ 新建对话</button>
+
+            <!-- 联网开关 -->
+            <div class="web-toggle">
+                <label class="toggle-label">
+                    <input type="checkbox" id="webSearchToggle" checked onchange="toggleWebSearch()">
+                    <span>🌐 联网搜索</span>
+                </label>
+            </div>
+
+            <!-- 历史对话列表 -->
+            <div class="history-section">
+                <p class="history-label">💬 历史对话</p>
+                <div id="historyList" class="history-list"></div>
+            </div>
+
+            <!-- 已上传文档 -->
+            <div class="history-section">
+                <p class="history-label">📄 已上传文档</p>
+                <div id="docList" class="history-list"></div>
+            </div>
+
+            <div class="sidebar-footer">
+                <p>LLM: <span id="llmInfo">-</span></p>
+                <p>Vector: <span id="vecInfo">-</span></p>
+            </div>
+        </aside>
+
+        <!-- 聊天区 -->
+        <main class="chat-area">
+            <div class="chat-header" id="chatHeader">🤖 Boss Agent 模式 · 自动识别意图，智能调度子Agent</div>
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome">
+                    <h1>👋 Agent Workshop</h1>
+                    <p>一站式 AI 知识库与智能诊断平台</p>
+                    <div class="welcome-tips">
+                        <span>💡 试试这些：</span>
+                        <button onclick="sendSample('OSPF 协议怎么配置？')">OSPF 配置方法</button>
+                        <button onclick="sendSample('核心交换机 CPU 飙到 95% 怎么排查？')">CPU 异常排查</button>
+                        <button onclick="sendSample('帮我生成本周网络运行报告')">生成运行报告</button>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-input-area">
+                <input type="file" id="fileInput" accept=".txt,.md,.pdf" style="display:none" onchange="uploadFile()">
+                <button class="btn btn-upload" onclick="document.getElementById('fileInput').click()" title="上传文档">📎</button>
+                <textarea id="chatInput" placeholder="输入您的问题，或点击📎上传文档..." rows="1" onkeydown="handleKey(event)"></textarea>
+                <button class="btn btn-send" onclick="sendMessage()">发送</button>
+                <button class="btn btn-stop" onclick="stopStreaming()" style="display:none">停止</button>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // ==================== 会话管理 ====================
+        const STORAGE_KEY = 'agent_workshop_session';
+        let sessionId = localStorage.getItem(STORAGE_KEY) || ('session_' + Date.now());
+        // URL 参数切换 Agent 模式：?mode=supervisor / ?mode=plan_execute / ?mode=boss
+        const urlParams = new URLSearchParams(window.location.search);
+        const urlMode = urlParams.get('mode') || 'auto';
+        document.getElementById('chatHeader').textContent =
+            urlMode === 'supervisor' ? '👔 Supervisor 模式 · 主Agent派发子Agent' :
+            urlMode === 'plan_execute' ? '📋 Plan-Execute 模式 · 多步规划诊断' :
+            urlMode === 'boss' ? '🤖 Boss Agent · Supervisor+PlanExecute' :
+            '🤖 Boss Agent 模式 · 自动识别意图，智能调度子Agent';
+
+        function saveSessionId() {
+            localStorage.setItem(STORAGE_KEY, sessionId);
+        }
+        saveSessionId();
+
+        // ==================== 联网开关 ====================
+        let webSearchEnabled = true;
+        function toggleWebSearch() {
+            webSearchEnabled = document.getElementById('webSearchToggle').checked;
+        }
+
+        // ==================== 发送锁 ====================
+        let isStreaming = false;
+        let currentAbortController = null;
+
+        function stopStreaming() {
+            if (currentAbortController) {
+                currentAbortController.abort();
+                currentAbortController = null;
+            }
+            fetch('/api/agent/stop?session_id=' + sessionId, { method: 'POST' }).catch(() => {});
+            isStreaming = false;
+            document.getElementById('chatInput').disabled = false;
+            document.getElementById('chatInput').placeholder = '输入您的问题...';
+            document.querySelector('.btn-send').style.display = '';
+            document.querySelector('.btn-stop').style.display = 'none';
+        }
+
+        // ==================== 发送消息 ====================
+        async function sendMessage() {
+            if (isStreaming) return;
+            const input = document.getElementById('chatInput');
+            const question = input.value.trim();
+            if (!question) return;
+            input.value = '';
+            input.style.height = 'auto';
+            isStreaming = true;
+            input.disabled = true;
+            input.placeholder = 'AI 回复中...';
+            document.querySelector('.btn-send').style.display = 'none';
+            document.querySelector('.btn-stop').style.display = '';
+            const welcome = document.querySelector('.welcome');
+            if (welcome) welcome.style.display = 'none';
+            appendMessage('user', question);
+
+            const aiMsg = appendMessage('assistant', '思考中...');
+            const contentEl = aiMsg.querySelector('.msg-content');
+
+            currentAbortController = new AbortController();
+            try {
+                const resp = await fetch('/api/agent/stream', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question, agent_mode: urlMode, session_id: sessionId, web_search: webSearchEnabled }),
+                    signal: currentAbortController.signal,
+                });
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '', fullContent = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+                        try {
+                            const json = JSON.parse(data);
+                            if (json.type === 'text') {
+                                fullContent += json.content;
+                                contentEl.innerHTML = marked.parse(fullContent);
+                            } else if (json.type === 'tool_call') {
+                                contentEl.innerHTML = marked.parse(fullContent + `\n\n🔧 调用工具: **${json.tool}**...`);
+                            } else if (json.type === 'tool_result') {
+                                contentEl.innerHTML = marked.parse(fullContent + `\n\n📋 工具返回: ${json.preview}...`);
+                            } else if (json.type === 'step') {
+                                fullContent += `\n> ✅ ${json.task}\n`;
+                                contentEl.innerHTML = marked.parse(fullContent);
+                            } else if (json.type === 'plan') {
+                                fullContent += `\n### 📋 诊断计划\n${json.plan.map(s => `- ${s}`).join('\n')}\n`;
+                                contentEl.innerHTML = marked.parse(fullContent);
+                            } else if (json.type === 'report') {
+                                fullContent = json.content;
+                                contentEl.innerHTML = marked.parse(fullContent);
+                            } else if (json.content) {
+                                fullContent += json.content;
+                                contentEl.innerHTML = marked.parse(fullContent);
+                            }
+                        } catch (e) {}
+                    }
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                }
+                if (!fullContent) contentEl.textContent = '(未收到回复)';
+                // 刷新历史列表
+                loadHistory();
+            } catch (e) {
+                if (e.name === 'AbortError') contentEl.textContent = fullContent || '(已停止)';
+                else contentEl.textContent = '请求失败: ' + e.message;
+            } finally {
+                stopStreaming();
+            }
+        }
+
+        // ==================== 文件上传 ====================
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) return;
+            fileInput.value = '';
+            const welcome = document.querySelector('.welcome');
+            if (welcome) welcome.style.display = 'none';
+            appendMessage('user', `📄 上传文件：${file.name} (${(file.size/1024).toFixed(1)} KB)`);
+            const aiMsg = appendMessage('assistant', '⏳ 正在解析文档...');
+            const contentEl = aiMsg.querySelector('.msg-content');
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('session_id', sessionId);
+                const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+                if (data.status !== 'ok') { contentEl.textContent = '❌ 上传失败'; return; }
+                let result = `### 📄 ${data.file_name} 处理完成\n\n| 属性 | 值 |\n|---|---|\n`;
+                result += `| 分块数 | ${data.chunk_count} |\n`;
+                result += `| 向量入库 | ✅ ${data.stored_count || data.chunk_count} 条 |\n`;
+                contentEl.innerHTML = marked.parse(result);
+                // 直接追加到文档列表（不等 API 刷新）
+                addDocToList(file.name, data.chunk_count);
+                // 上传记录持久化到会话历史
+                fetch('/api/agent', { method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({question: `📄 上传文件：${file.name}`, session_id: sessionId}) }).catch(()=>{});
+            } catch (e) { contentEl.textContent = '❌ 请求失败: ' + e.message; }
+            finally {
+                document.getElementById('chatMessages').scrollTop = document.getElementById('chatMessages').scrollHeight;
+            }
+        }
+
+        function sendSample(text) { document.getElementById('chatInput').value = text; sendMessage(); }
+
+        // ==================== 消息渲染 ====================
+        function appendMessage(role, content) {
+            const div = document.createElement('div');
+            div.className = 'message ' + role;
+            div.innerHTML = `<div class="msg-avatar">${role === 'user' ? '👤' : '🤖'}</div><div class="msg-content">${content}</div>`;
+            document.getElementById('chatMessages').appendChild(div);
+            document.getElementById('chatMessages').scrollTop = document.getElementById('chatMessages').scrollHeight;
+            return div;
+        }
+
+        function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
+
+        // ==================== 会话切换 ====================
+        function newChat() {
+            sessionId = 'session_' + Date.now();
+            saveSessionId();
+            document.getElementById('chatMessages').innerHTML = `
+                <div class="welcome">
+                    <h1>👋 Agent Workshop</h1>
+                    <p>一站式 AI 知识库与智能诊断平台</p>
+                    <div class="welcome-tips">
+                        <span>💡 试试这些：</span>
+                        <button onclick="sendSample('OSPF 协议怎么配置？')">OSPF 配置方法</button>
+                        <button onclick="sendSample('核心交换机 CPU 飙到 95% 怎么排查？')">CPU 异常排查</button>
+                        <button onclick="sendSample('帮我生成本周网络运行报告')">生成运行报告</button>
+                    </div>
+                </div>`;
+            loadHistory();
+        }
+
+        async function switchSession(sid) {
+            sessionId = sid;
+            saveSessionId();
+            document.getElementById('chatMessages').innerHTML = '';
+            try {
+                const resp = await fetch('/api/session/' + sid);
+                const data = await resp.json();
+                for (const msg of (data.messages || [])) {
+                    appendMessage(msg.role, msg.content);
+                }
+                // 高亮当前选中的
+                document.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
+                const item = document.querySelector(`[data-sid="${sid}"]`);
+                if (item) item.classList.add('active');
+            } catch (e) { console.error(e); }
+            document.getElementById('chatMessages').scrollTop = document.getElementById('chatMessages').scrollHeight;
+        }
+
+        // ==================== 历史列表 ====================
+        async function deleteSession(sid) {
+            if (!confirm('确定删除这个对话？')) return;
+            try {
+                await fetch('/api/session/' + sid, { method: 'DELETE' });
+                if (sid === sessionId) {
+                    newChat();  // 正在看的对话被删了，开新对话
+                } else {
+                    loadHistory();
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadHistory() {
+            try {
+                const resp = await fetch('/api/sessions');
+                const data = await resp.json();
+                const list = document.getElementById('historyList');
+                list.innerHTML = '';
+                for (const s of (data.sessions || [])) {
+                    const div = document.createElement('div');
+                    div.className = 'history-item' + (s.id === sessionId ? ' active' : '');
+                    div.setAttribute('data-sid', s.id);
+                    div.title = s.preview;
+                    div.innerHTML = `<span class="hist-preview">${s.preview || '(空对话)'}</span>
+                        <span class="hist-count">${s.count}条</span>
+                        <span class="hist-delete" title="删除">×</span>`;
+                    div.querySelector('.hist-preview').onclick = () => switchSession(s.id);
+                    div.querySelector('.hist-delete').onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
+                    list.appendChild(div);
+                }
+            } catch (e) {}
+        }
+
+        // ==================== 初始化 ====================
+        fetch('/health').then(r => r.json()).then(d => {
+            document.getElementById('llmInfo').textContent = d.llm.provider + '/' + d.llm.model;
+            document.getElementById('vecInfo').textContent = 'milvus';
+        });
+
+        // ==================== 文档管理 ====================
+        function addDocToList(name, chunkCount) {
+            const list = document.getElementById('docList');
+            // 移除"暂无文档"
+            const empty = list.querySelector('.history-item[style]');
+            if (empty) empty.remove();
+            // 检查是否已存在（避免重复）
+            for (const el of list.querySelectorAll('.hist-preview')) {
+                if (el.textContent === name) { el.parentElement.remove(); }
+            }
+            const div = document.createElement('div');
+            div.className = 'history-item';
+            div.setAttribute('data-doc-name', name);
+            div.innerHTML = `<span class="hist-preview">${name}</span>
+                <span class="hist-count">${chunkCount}块</span>
+                <span class="hist-delete" title="删除">×</span>`;
+            div.querySelector('.hist-delete').onclick = async (e) => {
+                e.stopPropagation();
+                if (!confirm('确定删除文档？')) return;
+                await fetch('/api/documents/' + encodeURIComponent(name), { method: 'DELETE' });
+                div.remove();  // 直接从 DOM 移除
+                if (!list.querySelector('.history-item')) {
+                    list.innerHTML = '<div class="history-item" style="cursor:default;color:#555">暂无文档</div>';
+                }
+            };
+            list.appendChild(div);
+        }
+
+        async function loadDocuments() {
+            try {
+                const resp = await fetch('/api/documents');
+                const data = await resp.json();
+                const list = document.getElementById('docList');
+                list.innerHTML = '';
+                for (const d of (data.documents || [])) {
+                    addDocToList(d.file_name || d.doc_id || '未知', d.chunk_count);
+                }
+                if (!data.documents.length) list.innerHTML = '<div class="history-item" style="cursor:default;color:#555">暂无文档</div>';
+            } catch (e) { console.error('loadDocuments 失败:', e); }
+        }
+
+        // ==================== 审计追踪 ====================
+        async function loadTraces() {
+            try {
+                const resp = await fetch('/api/audit/traces?limit=10');
+                const data = await resp.json();
+                const list = document.getElementById('traceList');
+                list.innerHTML = '';
+                for (const t of (data.traces || [])) {
+                    const div = document.createElement('div');
+                    div.className = 'history-item';
+                    const statusColor = t.status === 'error' ? '#e94560' : '#4caf50';
+                    div.innerHTML = `<span class="hist-preview" style="font-size:11px">${t.user_query?.substring(0,20) || ''}...</span>
+                        <span class="hist-count" style="color:${statusColor}">${t.total_latency_ms}ms</span>`;
+                    div.onclick = () => showTraceDetail(t.trace_id);
+                    list.appendChild(div);
+                }
+                if (!data.traces.length) list.innerHTML = '<div class="history-item" style="cursor:default;color:#555">暂无记录</div>';
+            } catch (e) {}
+        }
+
+        async function showTraceDetail(traceId) {
+            try {
+                const resp = await fetch('/api/audit/trace/' + traceId);
+                const data = await resp.json();
+                const spans = data.spans || [];
+                let html = `### 🔍 Trace ${traceId} (${data.trace?.total_latency_ms || 0}ms)\n\n`;
+                html += `| Span类型 | 名称 | 耗时 | \n|---|---|---|\n`;
+                for (const s of spans) {
+                    html += `| ${s.span_type} | ${s.span_name} | ${s.duration_ms}ms |\n`;
+                    if (s.output_data) html += `\n> ${s.output_data.substring(0, 200)}\n`;
+                }
+                const msgs = document.getElementById('chatMessages');
+                const div = document.createElement('div');
+                div.className = 'message assistant';
+                div.innerHTML = `<div class="msg-avatar">📊</div><div class="msg-content">${marked.parse(html)}</div>`;
+                msgs.appendChild(div);
+                msgs.scrollTop = msgs.scrollHeight;
+            } catch (e) {}
+        }
+
+        // 页面加载时恢复会话消息
+        (async function restore() {
+            loadDocuments();
+            if (localStorage.getItem(STORAGE_KEY)) {
+                await switchSession(sessionId);
+            }
+            loadHistory();
+        })();
+    </script>
+</body>
+</html>

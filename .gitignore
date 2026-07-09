@@ -1,0 +1,10 @@
+.env
+chroma_db/
+logs/
+data/
+__pycache__/
+*.pyc
+.idea/
+volumes/
+check_milvus.py
+list_mysql.py

@@ -1,0 +1,379 @@
+"""
+Plan-Execute-Replan Agent — StateGraph 手写模式
+
+适用场景：复杂多步故障诊断
+特点：
+    - Planner：先检索历史案例 → 生成排查计划
+    - Executor：取 plan[0] 逐步执行工具调用
+    - Replanner：每步后评估：continue / replan / respond
+    - 5 层防循环控制（提示词约束 + 代码强制）
+
+面试考点：
+    Q: "为什么用 Plan-Execute-Replan 而不是 ReAct？"
+    A: 多步复杂任务（告警→日志→监控→分析→报告）需要全局规划，
+       ReAct 边走边看容易偏离方向。P-E-R 有 Planner 做全局规划，
+       Replanner 做动态调整，加上 5 层防循环兜底。
+
+Author: 程响
+"""
+
+import operator
+from textwrap import dedent
+from typing import Annotated, TypedDict
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
+
+from app.config import config
+from app.llm_factory import get_chat_model
+from app.logger import logger
+from .tools import DEFAULT_TOOLS
+
+
+# ==================== 状态定义 ====================
+
+class PlanExecuteState(TypedDict):
+    input: str
+    plan: list[str]
+    past_steps: Annotated[list[tuple], operator.add]
+    response: str
+
+
+# ==================== Pydantic 输出约束 ====================
+
+class Plan(BaseModel):
+    steps: list[object] = Field(
+        default_factory=list,
+        alias="steps",
+        description="诊断步骤列表，字符串或 {action, description}",
+    )
+    plan: list[object] = Field(
+        default_factory=list,
+        alias="plan",
+        description="LLM 可能返回 plan 而不是 steps",
+    )
+
+    def get_steps(self) -> list[str]:
+        """兼容多种 LLM 输出格式"""
+        raw = self.steps or self.plan or []
+        result = []
+        for s in raw:
+            if isinstance(s, str):
+                result.append(s)
+            elif isinstance(s, dict):
+                # 格式1: {action, description}
+                # 格式2: {step, action, tool, parameters}
+                action = s.get("action") or s.get("tool") or ""
+                desc = s.get("description") or s.get("reason") or ""
+                params = s.get("parameters", "")
+                step_num = s.get("step", "")
+                parts = []
+                if step_num:
+                    parts.append(f"步骤{step_num}")
+                if action:
+                    parts.append(action)
+                if params:
+                    parts.append(f"({params})")
+                if desc:
+                    parts.append(f"— {desc}")
+                result.append(" ".join(parts) if parts else str(s))
+            else:
+                result.append(str(s))
+        return result
+
+
+class Response(BaseModel):
+    response: str = Field(default="", description="最终诊断报告")
+    report: str = Field(default="", description="LLM 可能返回 report 字段")
+
+    def get_response(self) -> str:
+        r = self.response or self.report or ""
+        if isinstance(r, dict):
+            return str(r)
+        return r
+
+
+class Act(BaseModel):
+    action: str = Field(default="continue", description="continue / replan / respond")
+    decision: str = Field(default="continue", alias="decision", description="LLM 可能用 decision 代替 action")
+    new_steps: list[object] = Field(default_factory=list, description="新步骤（仅 replan 时填写）")
+
+    def get_action(self) -> str:
+        val = self.action or self.decision or "continue"
+        # 统一：respond > replan > continue
+        if "respond" in val.lower() or "finish" in val.lower():
+            return "respond"
+        if "replan" in val.lower():
+            return "replan"
+        return "continue"
+
+    def get_new_steps(self) -> list[str]:
+        result = []
+        for s in self.new_steps:
+            if isinstance(s, str):
+                result.append(s)
+            elif isinstance(s, dict):
+                result.append(str(s))
+            else:
+                result.append(str(s))
+        return result
+
+
+# ==================== 提示词 ====================
+
+PLANNER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", dedent("""\
+    你是网络故障诊断规划专家。根据用户描述的故障和可用工具，制定排查计划。
+    输出 JSON 格式的计划。
+
+    可用工具：{tools_description}
+
+    {experience}
+
+    规则：
+    - 每步必须具体：明确使用哪个工具、参数是什么
+    - 步骤有逻辑依赖关系：先查告警→再查日志→分析→总结
+    - 3-5 步即可，不要过度拆分
+    """)),
+    ("user", "故障描述：{input}"),
+])
+
+EXECUTOR_SYSTEM = dedent("""\
+你是故障排查执行专家。根据当前步骤描述，选择合适的工具执行。
+只执行当前这一个步骤，不要考虑其他步骤。如果工具调用失败，说明原因。
+严格基于工具返回的实际数据，不编造任何数值、告警名或日志内容。
+""")
+
+REPLANNER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", dedent("""\
+    你是诊断评估专家。根据已执行步骤判断下一步行动，输出 JSON 格式。
+
+    三种决策（优先级从高到低）：
+    1. respond — 信息已经充足，立即生成最终诊断报告（优先选这个！）
+    2. continue — 当前计划合理，继续执行下一步
+    3. replan — 计划有严重问题，需要调整（谨慎使用）
+
+    标准：
+    - 已有 ≥3 步且获取了关键信息 → 优先 respond
+    - 已有 ≥5 步 → 必须 respond
+    - 当前信息能回答用户问题时 → 立即 respond，不等所有步骤完成
+    """)),
+    ("user", "原始问题：{input}\n已执行步骤：{past_steps}\n剩余计划：{plan}"),
+])
+
+RESPONSE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "基于已执行的诊断步骤生成最终报告（JSON 格式）。使用 Markdown 语法。严格基于实际数据，不编造任何信息。数据不足处明确标注'待确认'。"),
+    ("user", "原始问题：{input}\n执行记录：{past_steps}"),
+])
+
+
+# ==================== 格式化辅助 ====================
+
+def _format_tools(tools) -> str:
+    return "\n".join(f"- {t.name}: {t.description}" for t in tools)
+
+
+def _format_past_steps(steps: list[tuple]) -> str:
+    if not steps:
+        return "（无）"
+    return "\n".join(
+        f"步骤{i}: {s}\n结果: {r[:300]}" for i, (s, r) in enumerate(steps, 1)
+    )
+
+
+# ==================== Agent 实现 ====================
+
+class PlanExecuteAgent:
+    """
+    Plan-Execute-Replan Agent
+
+    使用：
+        agent = PlanExecuteAgent()
+        answer = await agent.ainvoke("核心交换机 CPU 飙到 95%，排查")
+    """
+
+    def __init__(self):
+        self.llm = get_chat_model(temperature=0.0, streaming=False)
+        self.tools = list(DEFAULT_TOOLS)
+        self.graph = self._build_graph()
+        logger.info("[PlanExecuteAgent] 初始化完成 (Planner + Executor + Replanner)")
+
+    def _build_graph(self):
+        workflow = StateGraph(PlanExecuteState)
+        workflow.add_node("planner", self._planner)
+        workflow.add_node("executor", self._executor)
+        workflow.add_node("replanner", self._replanner)
+        workflow.set_entry_point("planner")
+        workflow.add_edge("planner", "executor")
+        workflow.add_edge("executor", "replanner")
+        workflow.add_conditional_edges("replanner", self._should_continue, {
+            "executor": "executor",
+            END: END,
+        })
+        return workflow.compile(checkpointer=MemorySaver())
+
+    # ─── Planner ───
+
+    async def _planner(self, state: PlanExecuteState) -> dict:
+        logger.info("[Planner] 制定诊断计划...")
+
+        # 检索历史案例作为参考经验
+        experience = ""
+        try:
+            from retrieval.vector_store import vector_store_manager
+            docs = vector_store_manager.similarity_search(state["input"], k=2)
+            if docs:
+                experience = "相关历史案例：\n" + "\n".join(
+                    f"- {d.page_content[:200]}" for d in docs
+                )
+        except Exception as e:
+            logger.warning(f"[Planner] 检索经验失败: {e}")
+
+        chain = PLANNER_PROMPT | self.llm.with_structured_output(Plan)
+        result = await chain.ainvoke({
+            "input": state["input"],
+            "tools_description": _format_tools(self.tools),
+            "experience": experience,
+        })
+
+        plan = result.get_steps() if isinstance(result, Plan) else result.get("steps", [])
+        logger.info(f"[Planner] 计划: {len(plan)} 步")
+        for i, s in enumerate(plan, 1):
+            logger.info(f"  步骤{i}: {s}")
+
+        return {"plan": plan}
+
+    # ─── Executor ───
+
+    async def _executor(self, state: PlanExecuteState) -> dict:
+        plan = state.get("plan", [])
+        if not plan:
+            return {}
+
+        task = plan[0]
+        logger.info(f"[Executor] 执行: {task}")
+
+        try:
+            from langchain.agents import create_agent
+            agent = create_agent(
+                model=get_chat_model(temperature=0.0),
+                tools=self.tools,
+                system_prompt=EXECUTOR_SYSTEM,
+            )
+            messages = [
+                SystemMessage(content=EXECUTOR_SYSTEM),
+                HumanMessage(content=f"执行以下步骤: {task}"),
+            ]
+            result = await agent.ainvoke({"messages": messages})
+            last_msg = result["messages"][-1]
+            task_result = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        except Exception as e:
+            task_result = f"执行失败: {e}"
+
+        logger.info(f"[Executor] 完成, 结果长度: {len(task_result)}")
+        return {
+            "plan": plan[1:],
+            "past_steps": [(task, task_result)],
+        }
+
+    # ─── Replanner ───
+
+    async def _replanner(self, state: PlanExecuteState) -> dict:
+        plan = state.get("plan", [])
+        past = state.get("past_steps", [])
+
+        # 第3层：≥8 步强制 respond
+        if len(past) >= config.agent_max_steps:
+            logger.warning(f"[Replanner] 已达最大步数 {config.agent_max_steps}，强制 respond")
+            return await self._generate_response(state)
+
+        # 没有剩余计划 → 生成报告
+        if not plan:
+            logger.info("[Replanner] 计划执行完毕，生成报告")
+            return await self._generate_response(state)
+
+        # LLM 决策
+        chain = REPLANNER_PROMPT | self.llm.with_structured_output(Act)
+        result = await chain.ainvoke({
+            "input": state["input"],
+            "past_steps": _format_past_steps(past),
+            "plan": "\n".join(f"- {s}" for s in plan),
+        })
+        action = result.get_action() if isinstance(result, Act) else result.get("action", "continue")
+
+        # 第4层：≥5 步禁止 replan
+        if action == "replan" and len(past) >= 5:
+            logger.warning("[Replanner] 已执行 ≥5 步，禁止 replan，强制 respond")
+            return await self._generate_response(state)
+
+        # 第5层：新步骤截断
+        if action == "replan":
+            new_steps = result.get_new_steps() if isinstance(result, Act) else result.get("new_steps", [])
+            if len(new_steps) > len(plan):
+                new_steps = new_steps[:len(plan)]
+                logger.warning(f"[Replanner] 新步骤数超限，截断至 {len(new_steps)}")
+            logger.info(f"[Replanner] replan → {len(new_steps)} 个新步骤")
+            return {"plan": new_steps}
+
+        if action == "respond":
+            logger.info("[Replanner] respond → 生成最终报告")
+            return await self._generate_response(state)
+
+        logger.info("[Replanner] continue → 继续执行")
+        return {}
+
+    # ─── 条件边判断 ───
+
+    def _should_continue(self, state: PlanExecuteState) -> str:
+        if state.get("response"):
+            return END
+        if state.get("plan"):
+            return "executor"
+        return END
+
+    # ─── 生成最终报告 ───
+
+    async def _generate_response(self, state: PlanExecuteState) -> dict:
+        chain = RESPONSE_PROMPT | self.llm.with_structured_output(Response)
+        result = await chain.ainvoke({
+            "input": state["input"],
+            "past_steps": _format_past_steps(state.get("past_steps", [])),
+        })
+        response = result.get_response() if isinstance(result, Response) else result.get("response", result.get("report", ""))
+        return {"response": response}
+
+    # ─── 公共接口 ───
+
+    async def ainvoke(self, query: str, session_id: str = "default") -> str:
+        config = {"configurable": {"thread_id": session_id}}
+        initial: PlanExecuteState = {"input": query, "plan": [], "past_steps": [], "response": ""}
+        result = await self.graph.ainvoke(initial, config=config)
+        return result.get("response", "无法生成诊断报告")
+
+    async def astream(self, query: str, session_id: str = "default"):
+        config = {"configurable": {"thread_id": session_id}}
+        initial: PlanExecuteState = {"input": query, "plan": [], "past_steps": [], "response": ""}
+
+        async for chunk in self.graph.astream(initial, config=config, stream_mode="updates"):
+            if not chunk or not hasattr(chunk, "items"):
+                continue
+            for node_name, node_output in chunk.items():
+                if not node_output or not isinstance(node_output, dict):
+                    continue
+                if node_name == "planner":
+                    yield {"type": "plan", "plan": node_output.get("plan", [])}
+                elif node_name == "executor":
+                    past = node_output.get("past_steps", [])
+                    if past:
+                        yield {"type": "step", "task": past[-1][0], "result": past[-1][1][:100]}
+                elif node_name == "replanner":
+                    resp = node_output.get("response", "")
+                    if resp:
+                        yield {"type": "report", "content": resp}
+
+
+# 全局单例
+plan_execute_agent = PlanExecuteAgent()
