@@ -23,7 +23,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -122,52 +122,144 @@ class Act(BaseModel):
         return result
 
 
-# ==================== 提示词 ====================
+# ==================== 提示词（按意图动态切换） ====================
 
-PLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", dedent("""\
-    你是网络故障诊断规划专家。根据用户描述的故障和可用工具，制定排查计划。
-    输出 JSON 格式的计划。
+PROMPTS = {
+    "diagnosis": {
+        "planner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是网络故障诊断规划专家。根据用户描述的故障和可用工具，制定排查计划。
+            输出 JSON 格式的计划。
 
-    可用工具：{tools_description}
+            可用工具：{tools_description}
 
-    {experience}
+            {experience}
 
-    规则：
-    - 每步必须具体：明确使用哪个工具、参数是什么
-    - 步骤有逻辑依赖关系：先查告警→再查日志→分析→总结
-    - 3-5 步即可，不要过度拆分
-    """)),
-    ("user", "故障描述：{input}"),
-])
+            规则：
+            - 每步必须具体：明确使用哪个工具、参数是什么
+            - 步骤有逻辑依赖关系：先查告警→再查日志→分析→总结
+            - 3-5 步即可，不要过度拆分
+            """)),
+            ("user", "故障描述：{input}"),
+        ]),
+        "executor": dedent("""\
+        你是故障排查执行专家。根据当前步骤描述，选择合适的工具执行。
+        只执行当前这一个步骤，不要考虑其他步骤。如果工具调用失败，说明原因。
+        严格基于工具返回的实际数据，不编造任何数值、告警名或日志内容。
+        """),
+        "replanner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是诊断评估专家。根据已执行步骤判断下一步行动，输出 JSON 格式。
 
-EXECUTOR_SYSTEM = dedent("""\
-你是故障排查执行专家。根据当前步骤描述，选择合适的工具执行。
-只执行当前这一个步骤，不要考虑其他步骤。如果工具调用失败，说明原因。
-严格基于工具返回的实际数据，不编造任何数值、告警名或日志内容。
-""")
+            三种决策（优先级从高到低）：
+            1. respond — 信息已经充足，立即生成最终诊断报告（优先选这个！）
+            2. continue — 当前计划合理，继续执行下一步
+            3. replan — 计划有严重问题，需要调整（谨慎使用）
 
-REPLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", dedent("""\
-    你是诊断评估专家。根据已执行步骤判断下一步行动，输出 JSON 格式。
+            标准：
+            - 已有 ≥3 步且获取了关键信息 → 优先 respond
+            - 已有 ≥5 步 → 必须 respond
+            - 当前信息能回答用户问题时 → 立即 respond，不等所有步骤完成
+            """)),
+            ("user", "原始问题：{input}\n已执行步骤：{past_steps}\n剩余计划：{plan}"),
+        ]),
+        "response": ChatPromptTemplate.from_messages([
+            ("system", "基于已执行的诊断步骤生成最终报告（JSON 格式）。使用 Markdown 语法。严格基于实际数据，不编造任何信息。数据不足处明确标注'待确认'。"),
+            ("user", "原始问题：{input}\n执行记录：{past_steps}"),
+        ]),
+    },
+    "qa": {
+        "planner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是知识问答规划专家。根据用户问题，制定信息收集计划。
+            输出 JSON 格式的计划。
 
-    三种决策（优先级从高到低）：
-    1. respond — 信息已经充足，立即生成最终诊断报告（优先选这个！）
-    2. continue — 当前计划合理，继续执行下一步
-    3. replan — 计划有严重问题，需要调整（谨慎使用）
+            可用工具：{tools_description}
 
-    标准：
-    - 已有 ≥3 步且获取了关键信息 → 优先 respond
-    - 已有 ≥5 步 → 必须 respond
-    - 当前信息能回答用户问题时 → 立即 respond，不等所有步骤完成
-    """)),
-    ("user", "原始问题：{input}\n已执行步骤：{past_steps}\n剩余计划：{plan}"),
-])
+            规则：
+            - 第一步优先用 retrieve_knowledge 从知识库检索
+            - 知识库没有的资料用 web_search 联网搜索
+            - 需要实时数据（天气/新闻）直接 web_search
+            - 最后一步综合信息生成回答
+            - 2-4 步即可
+            """)),
+            ("user", "用户问题：{input}"),
+        ]),
+        "executor": dedent("""\
+        你是信息获取执行专家。根据当前步骤描述，选择合适的工具执行。
+        只执行当前这一个步骤。检索时使用具体的查询关键词。
+        严格基于工具返回的实际内容，不编造任何信息。
+        """),
+        "replanner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是信息完整性评估专家。根据已执行步骤判断下一步，输出 JSON 格式。
 
-RESPONSE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "基于已执行的诊断步骤生成最终报告（JSON 格式）。使用 Markdown 语法。严格基于实际数据，不编造任何信息。数据不足处明确标注'待确认'。"),
-    ("user", "原始问题：{input}\n执行记录：{past_steps}"),
-])
+            三种决策：
+            1. respond — 已收集足够信息回答用户问题（优先选这个！）
+            2. continue — 当前计划合理，继续执行下一步
+            3. replan — 信息不足，调整检索策略
+
+            标准：
+            - 已有 ≥2 步且获取了关键信息 → 优先 respond
+            - 已有 ≥4 步 → 必须 respond
+            - 知识库 + 联网搜索都返回结果时 → 立即 respond
+            """)),
+            ("user", "原始问题：{input}\n已执行步骤：{past_steps}\n剩余计划：{plan}"),
+        ]),
+        "response": ChatPromptTemplate.from_messages([
+            ("system", "基于收集到的信息生成最终回答（JSON 格式）。使用 Markdown 语法，综合知识库和联网搜索结果，给出准确完整的回答。信息不足处标注'未找到相关资料'。"),
+            ("user", "原始问题：{input}\n执行记录：{past_steps}"),
+        ]),
+    },
+    "report": {
+        "planner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是报告生成规划专家。根据用户需求，制定数据收集和报告生成计划。
+            输出 JSON 格式的计划。
+
+            可用工具：{tools_description}
+
+            规则：
+            - 了解需求：先确定报告的数据来源和格式
+            - 收集数据：检索、查询、统计
+            - 生成报告：最终汇总输出
+            - 3-5 步即可
+            """)),
+            ("user", "报告需求：{input}"),
+        ]),
+        "executor": dedent("""\
+        你是报告数据采集执行专家。根据当前步骤描述，选择合适的工具执行。
+        只执行当前这一步。严格基于工具返回的实际数据。
+        """),
+        "replanner": ChatPromptTemplate.from_messages([
+            ("system", dedent("""\
+            你是报告完整性评估专家。根据已执行步骤判断下一步，输出 JSON 格式。
+
+            三种决策：
+            1. respond — 数据已充足，立即生成报告
+            2. continue — 继续收集数据
+            3. replan — 调整数据收集策略
+
+            标准：
+            - 已有 ≥3 步且数据充分 → 优先 respond
+            - 已有 ≥5 步 → 必须 respond
+            """)),
+            ("user", "原始需求：{input}\n已执行步骤：{past_steps}\n剩余计划：{plan}"),
+        ]),
+        "response": ChatPromptTemplate.from_messages([
+            ("system", "基于收集到的数据生成最终报告（JSON 格式）。使用 Markdown 语法，结构清晰。数据不足处注明。"),
+            ("user", "原始需求：{input}\n执行记录：{past_steps}"),
+        ]),
+    },
+}
+
+# 默认兜底用 qa
+DEFAULT_INTENT = "qa"
+
+
+def _get_prompts(intent: str) -> dict:
+    """获取指定意图的提示词，fallback 到 qa"""
+    return PROMPTS.get(intent, PROMPTS[DEFAULT_INTENT])
 
 
 # ==================== 格式化辅助 ====================
@@ -198,6 +290,7 @@ class PlanExecuteAgent:
     def __init__(self):
         self.llm = get_chat_model(temperature=0.0, streaming=False)
         self.tools = list(DEFAULT_TOOLS)
+        self.intent = DEFAULT_INTENT
         self.graph = self._build_graph()
         logger.info("[PlanExecuteAgent] 初始化完成 (Planner + Executor + Replanner)")
 
@@ -213,33 +306,52 @@ class PlanExecuteAgent:
             "executor": "executor",
             END: END,
         })
-        return workflow.compile(checkpointer=MemorySaver())
+        import os; os.makedirs("data", exist_ok=True)
+        return workflow.compile(checkpointer=SqliteSaver.from_conn_string("data/checkpoints.db"))
 
     # ─── Planner ───
 
     async def _planner(self, state: PlanExecuteState) -> dict:
-        logger.info("[Planner] 制定诊断计划...")
+        logger.info(f"[Planner] 制定{self.intent}计划...")
 
-        # 检索历史案例作为参考经验
+        # 检索历史案例作为参考经验（仅 diagnosis 需要）
         experience = ""
-        try:
-            from retrieval.vector_store import vector_store_manager
-            docs = vector_store_manager.similarity_search(state["input"], k=2)
-            if docs:
-                experience = "相关历史案例：\n" + "\n".join(
-                    f"- {d.page_content[:200]}" for d in docs
-                )
-        except Exception as e:
-            logger.warning(f"[Planner] 检索经验失败: {e}")
+        if self.intent == "diagnosis":
+            try:
+                from retrieval.vector_store import vector_store_manager
+                docs = vector_store_manager.similarity_search(state["input"], k=2)
+                if docs:
+                    experience = "相关历史案例：\n" + "\n".join(
+                        f"- {d.page_content[:200]}" for d in docs
+                    )
+            except Exception as e:
+                logger.warning(f"[Planner] 检索经验失败: {e}")
 
-        chain = PLANNER_PROMPT | self.llm.with_structured_output(Plan)
+        prompts = _get_prompts(self.intent)
+        chain = prompts["planner"] | self.llm.with_structured_output(Plan)
         result = await chain.ainvoke({
             "input": state["input"],
             "tools_description": _format_tools(self.tools),
             "experience": experience,
         })
 
-        plan = result.get_steps() if isinstance(result, Plan) else result.get("steps", [])
+        plan = result.get_steps() if isinstance(result, Plan) else []
+        if not plan:
+            # fallback: 尝试从 result 直接取
+            if hasattr(result, 'model_dump'):
+                raw = result.model_dump()
+                plan = raw.get("steps") or raw.get("plan") or []
+                if plan and isinstance(plan[0], dict):
+                    plan = [s.get("action", str(s)) for s in plan]
+        if not plan:
+            logger.warning(f"[Planner] LLM 返回空计划！result={result}")
+            # qa 兜底：至少检索一次知识库
+            if self.intent == "qa":
+                plan = ["从知识库检索相关信息并综合回答"]
+            elif self.intent == "report":
+                plan = ["收集必要数据并生成报告"]
+            else:
+                plan = ["综合分析当前信息并给出结论"]
         logger.info(f"[Planner] 计划: {len(plan)} 步")
         for i, s in enumerate(plan, 1):
             logger.info(f"  步骤{i}: {s}")
@@ -258,13 +370,14 @@ class PlanExecuteAgent:
 
         try:
             from langchain.agents import create_agent
+            executor_prompt = _get_prompts(self.intent)["executor"]
             agent = create_agent(
                 model=get_chat_model(temperature=0.0),
                 tools=self.tools,
-                system_prompt=EXECUTOR_SYSTEM,
+                system_prompt=executor_prompt,
             )
             messages = [
-                SystemMessage(content=EXECUTOR_SYSTEM),
+                SystemMessage(content=executor_prompt),
                 HumanMessage(content=f"执行以下步骤: {task}"),
             ]
             result = await agent.ainvoke({"messages": messages})
@@ -296,7 +409,8 @@ class PlanExecuteAgent:
             return await self._generate_response(state)
 
         # LLM 决策
-        chain = REPLANNER_PROMPT | self.llm.with_structured_output(Act)
+        prompts = _get_prompts(self.intent)
+        chain = prompts["replanner"] | self.llm.with_structured_output(Act)
         result = await chain.ainvoke({
             "input": state["input"],
             "past_steps": _format_past_steps(past),
@@ -337,7 +451,8 @@ class PlanExecuteAgent:
     # ─── 生成最终报告 ───
 
     async def _generate_response(self, state: PlanExecuteState) -> dict:
-        chain = RESPONSE_PROMPT | self.llm.with_structured_output(Response)
+        prompts = _get_prompts(self.intent)
+        chain = prompts["response"] | self.llm.with_structured_output(Response)
         result = await chain.ainvoke({
             "input": state["input"],
             "past_steps": _format_past_steps(state.get("past_steps", [])),
@@ -347,13 +462,15 @@ class PlanExecuteAgent:
 
     # ─── 公共接口 ───
 
-    async def ainvoke(self, query: str, session_id: str = "default") -> str:
+    async def ainvoke(self, query: str, session_id: str = "default", intent: str = "qa") -> str:
+        self.intent = intent
         config = {"configurable": {"thread_id": session_id}}
         initial: PlanExecuteState = {"input": query, "plan": [], "past_steps": [], "response": ""}
         result = await self.graph.ainvoke(initial, config=config)
         return result.get("response", "无法生成诊断报告")
 
-    async def astream(self, query: str, session_id: str = "default"):
+    async def astream(self, query: str, session_id: str = "default", intent: str = "qa"):
+        self.intent = intent  # 动态切换 Prompt
         config = {"configurable": {"thread_id": session_id}}
         initial: PlanExecuteState = {"input": query, "plan": [], "past_steps": [], "response": ""}
 

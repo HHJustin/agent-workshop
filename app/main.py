@@ -124,12 +124,15 @@ async def agent_chat_stream(req: AgentRequest, request: Request):
     from agents import intent_router
     from agents.react_agent import react_agent
 
-    # 意图识别
-    if req.agent_mode == "auto":
-        route_result = await intent_router.route(req.question)
-        logger.info(f"[AutoRoute] {req.question[:30]}... → intent={route_result.intent}")
+    # 始终先检测用户意图
+    route_result = await intent_router.route(req.question)
+    actual_intent = route_result.intent
+    logger.info(f"[IntentRouter] {req.question[:30]}... → intent={actual_intent}")
 
-    # Agent 模式选择（URL 参数 ?mode=supervisor/plan_execute/boss 切换）
+    # Agent 模式选择
+    # PlanExecute/Supervisor 只在诊断场景生效，QA/Report 强制用 ReAct
+    req.agent_mode = actual_intent
+
     if req.agent_mode == "supervisor":
         from agents.supervisor import supervisor_agent
         agent = supervisor_agent
@@ -139,24 +142,22 @@ async def agent_chat_stream(req: AgentRequest, request: Request):
     elif req.agent_mode == "boss":
         from agents.boss_agent import boss_agent
         agent = boss_agent
-    else:
-        agent = react_agent  # 默认 ReAct
-
-    if req.agent_mode == "auto":
-        route_result = await intent_router.route(req.question)
-        req.agent_mode = route_result.intent
-        # 复杂诊断关键词 → 走 PlanExecute 深度模式
-        complex_keywords = ["全面排查", "根因分析", "综合分析", "彻底排查",
-                            "深度诊断", "完整诊断", "系统排查", "全面分析"]
-        is_diagnosis = route_result.intent == "diagnosis"
-        is_complex = any(kw in req.question for kw in complex_keywords) or len(req.question) > 30
-        if is_diagnosis and is_complex:
+    elif actual_intent == "diagnosis":
+        # diagnosis → PlanExecute（诊断场景直接用深度模式）
+        complex_keywords = ["排查", "诊断", "分析", "告警", "故障", "异常", "报错",
+                            "CPU", "内存", "磁盘", "网络", "重启", "宕机",
+                            "全面排查", "根因分析", "综合分析", "彻底排查"]
+        if any(kw in req.question for kw in complex_keywords):
             from agents.plan_execute import plan_execute_agent
             agent = plan_execute_agent
             req.agent_mode = "plan_execute"
             logger.info(f"[AutoRoute] 复杂诊断 → PlanExecute")
+        else:
+            agent = react_agent
+    else:
+        agent = react_agent  # qa/report → ReAct
 
-    logger.info(f"[AutoRoute] {req.question[:30]}... → intent={req.agent_mode}")
+    logger.info(f"[Route] {req.question[:30]}... → agent={type(agent).__name__}, intent={actual_intent}")
 
     # 审计追踪 + 日志 Trace ID 注入（Loguru contextualize 包裹全链路）
     trace = AuditTrace(session_id=req.session_id, user_query=req.question, intent=req.agent_mode)
@@ -177,7 +178,7 @@ async def agent_chat_stream(req: AgentRequest, request: Request):
         full_answer = []
         llm_span = trace.start_span("llm", "agent_execution", req.question[:200])
         try:
-            async for chunk in agent.astream(req.question, req.session_id):
+            async for chunk in agent.astream(req.question, req.session_id, intent=req.agent_mode):
                 if cancel_event.is_set():
                     logger.info("[Stream] 已取消")
                     break
@@ -343,8 +344,9 @@ async def list_documents():
 async def delete_session(session_id: str):
     """删除指定会话历史"""
     from agents.react_agent import react_agent
-    react_agent._sessions.pop(session_id, None)
-    react_agent._save_sessions()
+    if hasattr(react_agent, "_sessions"):
+        react_agent._sessions.pop(session_id, None)
+        react_agent._save_sessions()
     # 同时删除该会话上传的文档索引
     from retrieval.vector_store import vector_store_manager
     vector_store_manager.delete_by_source(f"session:{session_id}")
@@ -439,7 +441,8 @@ async def _do_upload(
         from documents.cleaner import full_clean
         from retrieval.vector_store import vector_store_manager
 
-        docs, info = load_document_with_info(tmp_path, pdf_fallback="pypdf")
+        # 自动判断 PDF 复杂度 → 逐级降级（PyPDF → pdfplumber → MinerU → OCR）
+        docs, info = load_document_with_info(tmp_path, pdf_fallback="auto")
         chunks = split_documents(docs)
 
         # 知识库分级：global（公共库，所有对话共享）/ session（个人库，仅当前对话）
@@ -447,6 +450,7 @@ async def _do_upload(
             c.metadata["_session_id"] = session_id
             c.metadata["_scope"] = scope  # global=公共库 / session=个人库
             c.metadata["_source"] = file.filename  # 统一用原始文件名，方便删除
+            c.metadata["_file_name"] = file.filename  # 覆盖 loader 写入的临时文件名
 
         # 6步清洗管道
         clean_result = full_clean(chunks, skip_l3=True, skip_l6=True)

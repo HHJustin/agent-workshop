@@ -59,7 +59,7 @@
                 </div>
             </div>
             <div class="chat-input-area">
-                <input type="file" id="fileInput" accept=".txt,.md,.pdf" style="display:none" onchange="uploadFile()">
+                <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx" style="display:none" onchange="uploadFile()">
                 <button class="btn btn-upload" onclick="document.getElementById('fileInput').click()" title="上传文档">📎</button>
                 <textarea id="chatInput" placeholder="输入您的问题，或点击📎上传文档..." rows="1" onkeydown="handleKey(event)"></textarea>
                 <button class="btn btn-send" onclick="sendMessage()">发送</button>

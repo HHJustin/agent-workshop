@@ -20,7 +20,7 @@ from typing import Literal
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -108,7 +108,8 @@ class SupervisorAgent:
         workflow.add_edge("qa", "supervisor")
         workflow.add_edge("diagnosis", "supervisor")
 
-        return workflow.compile(checkpointer=MemorySaver())
+        import os; os.makedirs("data", exist_ok=True)
+        return workflow.compile(checkpointer=SqliteSaver.from_conn_string("data/checkpoints.db"))
 
     async def _call_supervisor(self, state: SupervisorState):
         messages = [SystemMessage(content=SUPERVISOR_PROMPT)] + list(state["messages"])

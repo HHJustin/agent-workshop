@@ -18,7 +18,7 @@ Author: 程响
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -113,7 +113,8 @@ class BossAgent:
         workflow.add_edge("react", "supervisor")
         workflow.add_edge("plan_execute", "supervisor")
 
-        return workflow.compile(checkpointer=MemorySaver())
+        import os; os.makedirs("data", exist_ok=True)
+        return workflow.compile(checkpointer=SqliteSaver.from_conn_string("data/checkpoints.db"))
 
     async def _call_supervisor(self, state: BossState):
         messages = [SystemMessage(content=BOSS_PROMPT)] + list(state["messages"])
@@ -177,7 +178,7 @@ class BossAgent:
         last_msg = result["messages"][-1]
         return last_msg.content if hasattr(last_msg, "content") else str(last_msg)
 
-    async def astream(self, query: str, session_id: str = "default"):
+    async def astream(self, query: str, session_id: str = "default", intent: str = "qa"):
         """流式：子 Agent 的每个 token 实时穿透到前端"""
         import asyncio
         self._stream_queue = asyncio.Queue()

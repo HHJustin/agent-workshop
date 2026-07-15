@@ -8,3 +8,4 @@ __pycache__/
 volumes/
 check_milvus.py
 list_mysql.py
+面试准备_Agent_Workshop.md

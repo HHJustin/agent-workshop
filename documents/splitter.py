@@ -18,11 +18,13 @@ from langchain_text_splitters import (
     RecursiveCharacterTextSplitter,
 )
 
-# 配置（可后续移到 config.py）
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 100
-MIN_CHUNK_SIZE = 300
-SECONDARY_CHUNK_SIZE = 1600  # 二次分割用更大的 chunk
+from app.config import config
+
+# 从配置读取，支持 .env 覆盖
+CHUNK_SIZE = config.chunk_size         # 默认 800，可改 .env 的 CHUNK_SIZE
+CHUNK_OVERLAP = config.chunk_overlap   # 默认 100
+MIN_CHUNK_SIZE = config.min_chunk_size # 默认 300
+SECONDARY_CHUNK_SIZE = CHUNK_SIZE * 2  # 二次分割用更大的 chunk
 
 # Markdown 标题分割器
 MARKDOWN_SPLITTER = MarkdownHeaderTextSplitter(
@@ -101,15 +103,43 @@ def _split_markdown(doc: Document) -> List[Document]:
 
 
 def _split_text(doc: Document) -> List[Document]:
-    """普通文本分割"""
+    """普通文本分割 — 优先按语义段落边界切，字符长度兜底"""
     content = doc.page_content
     if not content or not content.strip():
         return []
 
-    docs = TEXT_SPLITTER.create_documents(
-        texts=[content],
-        metadatas=[doc.metadata],
-    )
+    # 先用段落（连续空行）做语义分割
+    # "个人信息\n姓名：张三\n电话：138\n\n教育背景\n..." → 两个语义块
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+
+    if len(paragraphs) <= 1:
+        # 没有明显段落结构，按字符分块
+        docs = TEXT_SPLITTER.create_documents(texts=[content], metadatas=[doc.metadata])
+        return docs
+
+    # 有段落结构：每段尝试独立成 chunk
+    docs = []
+    current_chunk = ""
+    for para in paragraphs:
+        # 如果当前累积 + 新段落不超过 chunk_size，合并
+        if len(current_chunk) + len(para) < CHUNK_SIZE:
+            current_chunk = para if not current_chunk else current_chunk + "\n\n" + para
+        else:
+            # 当前块满了，保存并开始新块
+            if current_chunk:
+                docs.append(Document(page_content=current_chunk, metadata=doc.metadata.copy()))
+                current_chunk = ""
+            # 新段落如果太长，再字符切割
+            if len(para) > CHUNK_SIZE:
+                sub_docs = TEXT_SPLITTER.create_documents(texts=[para], metadatas=[doc.metadata])
+                docs.extend(sub_docs)
+            else:
+                current_chunk = para
+
+    # 残留
+    if current_chunk.strip():
+        docs.append(Document(page_content=current_chunk, metadata=doc.metadata.copy()))
+
     return docs
 
 

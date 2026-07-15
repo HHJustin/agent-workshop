@@ -1,13 +1,31 @@
 """
-PDF 处理模块 — PyPDFLoader + MinerU 双方案
+PDF 处理模块 — 四级处理管道
 
-设计思路：
-    - 简单 PDF（纯文本、无表格/多栏）→ PyPDFLoader：速度优先，pip install 即用
-    - 复杂 PDF（表格、公式、多栏排版、扫描件）→ MinerU：精度优先，保留结构
+标准流程（遵循业界最佳实践）：
+    1. 文本提取（Parsing）
+       ├── 文本型 PDF → PyPDFLoader（快）或 pdfplumber（保留表格）
+       ├── 表格密集型 → pdfplumber（保留行列结构）
+       ├── 复杂排版/公式 → MinerU（结构化解析 + OCR）
+       └── 扫描图片型 → OCR Pipeline（pdf2image → PaddleOCR/Tesseract）
+
+    2. 清洗与结构化（Cleaning）→ cleaner.py 六步管道
+       ├── 去噪：页眉页脚、页码、水印
+       ├── 结构还原：基于字体大小识别标题层级
+       ├── 表格转 Markdown/JSON
+       └── 去重：目录页与正文重复识别
+
+    3. 分块（Chunking）→ splitter.py
+       ├── 按段落自然边界优先切
+       ├── 超长段按字符切兜底
+       └── 表格/代码块保护（不可分割原子块）
+
+    4. 向量化与存储 → vector_store.py
+       └── Embedding → Milvus
 
 面试话术：
     "PDF 解析我做了分级处理。先用规则判断文档复杂度—
-     简单文档走 PyPDFLoader 快速提取，复杂排版走 MinerU 做结构化解析。
+     纯文本走 PyPDFLoader（快），表格多走 pdfplumber（保留结构），
+     复杂排版走 MinerU（精度优先），扫描件走 OCR。
      性能和精度兼顾，不是所有 PDF 都走慢路径。"
 
 Author: 程响
@@ -22,7 +40,7 @@ from typing import Optional
 
 from langchain_core.documents import Document
 
-logger = logging.getLogger(__name__)
+from app.logger import logger
 
 
 # ============================================================
@@ -175,6 +193,170 @@ def extract_text_pypdf(file_path: str | Path) -> list[Document]:
 
 
 # ============================================================
+# pdfplumber 方案（表格密集型文档）
+# ============================================================
+
+def extract_text_pdfplumber(file_path: str | Path) -> list[Document]:
+    """
+    使用 pdfplumber 提取 PDF 文本（保留表格行列结构）
+
+    适用场景：产品手册、技术文档等含表格的 PDF
+    优势：表格自动转 Markdown/JSON，保留行列结构；比 MinerU 轻量
+    依赖：pip install pdfplumber
+
+    Args:
+        file_path: PDF 文件路径
+
+    Returns:
+        list[Document]: LangChain Document 列表（每页一个 Document）
+    """
+    file_path = str(file_path)
+
+    try:
+        import pdfplumber
+
+        documents = []
+        with pdfplumber.open(file_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                parts = []
+
+                # 1. 提取文本
+                text = page.extract_text()
+                if text:
+                    parts.append(text)
+
+                # 2. 提取表格并转为 Markdown
+                tables = page.extract_tables()
+                for t_idx, table in enumerate(tables):
+                    if table and len(table) > 1:
+                        md_table = _table_to_markdown(table)
+                        parts.append(f"\n【表格 {t_idx + 1}】\n{md_table}")
+
+                content = "\n".join(parts)
+                if content.strip():
+                    documents.append(Document(
+                        page_content=content,
+                        metadata={
+                            "_source": file_path,
+                            "_loader": "pdfplumber",
+                            "_file_name": Path(file_path).name,
+                            "_page": i + 1,
+                            "_tables": len(tables),
+                        },
+                    ))
+
+        logger.info(f"[pdfplumber] {Path(file_path).name}: {len(documents)} 页")
+        return documents
+
+    except ImportError:
+        raise ImportError("pdfplumber 需要安装: pip install pdfplumber")
+    except Exception as e:
+        logger.error(f"[pdfplumber] 提取失败: {file_path}, 错误: {e}")
+        raise RuntimeError(f"pdfplumber 提取失败: {e}") from e
+
+
+def _table_to_markdown(table: list[list]) -> str:
+    """将二维表格列表转为 Markdown 格式"""
+    if not table:
+        return ""
+    lines = []
+    # 表头
+    headers = [str(c) if c else "" for c in table[0]]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    # 数据行
+    for row in table[1:]:
+        cells = [str(c) if c else "" for c in row]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+# ============================================================
+# OCR 方案（扫描图片型 PDF）
+# ============================================================
+
+def extract_text_ocr(file_path: str | Path, ocr_engine: str = "paddle") -> list[Document]:
+    """
+    使用 OCR 提取扫描图片型 PDF 的文本
+
+    适用场景：扫描件、图片型 PDF（不可复制文本）
+    流程：PDF → pdf2image 转图片 → OCR 识别 → 文本
+    引擎：PaddleOCR（中文效果好）、Tesseract（通用）、EasyOCR
+
+    Args:
+        file_path: PDF 文件路径
+        ocr_engine: OCR 引擎 paddle/tesseract/easyocr
+
+    Returns:
+        list[Document]: LangChain Document 列表
+    """
+    file_path = str(file_path)
+
+    try:
+        from pdf2image import convert_from_path
+
+        images = convert_from_path(file_path, dpi=200)
+        logger.info(f"[OCR] {Path(file_path).name}: {len(images)} 页图片待识别")
+
+        ocr_func = _get_ocr_engine(ocr_engine)
+        documents = []
+
+        for i, img in enumerate(images):
+            text = ocr_func(img)
+            if text.strip():
+                documents.append(Document(
+                    page_content=text,
+                    metadata={
+                        "_source": file_path,
+                        "_loader": f"OCR/{ocr_engine}",
+                        "_file_name": Path(file_path).name,
+                        "_page": i + 1,
+                    },
+                ))
+
+        logger.info(f"[OCR] {Path(file_path).name}: 识别完成, {len(documents)} 页有内容")
+        return documents
+
+    except ImportError as e:
+        raise ImportError(
+            f"OCR 依赖未安装: {e}。\n"
+            "安装方式:\n"
+            "  PaddleOCR: pip install paddlepaddle paddleocr pdf2image\n"
+            "  Tesseract: pip install pytesseract pdf2image (需安装 tesseract-ocr)\n"
+            "  EasyOCR:   pip install easyocr pdf2image"
+        )
+    except Exception as e:
+        logger.error(f"[OCR] 识别失败: {file_path}, 错误: {e}")
+        raise RuntimeError(f"OCR 识别失败: {e}") from e
+
+
+def _get_ocr_engine(engine: str):
+    """获取 OCR 引擎函数"""
+    if engine == "paddle":
+        try:
+            from paddleocr import PaddleOCR
+            ocr = PaddleOCR(lang="ch")
+            def _ocr(img):
+                import numpy as np
+                result = ocr.ocr(np.array(img), cls=False)
+                if not result or not result[0]:
+                    return ""
+                return "\n".join(line[1][0] for line in result[0] if line)
+            return _ocr
+        except ImportError:
+            raise ImportError("PaddleOCR 未安装")
+    elif engine == "tesseract":
+        import pytesseract
+        return lambda img: pytesseract.image_to_string(img, lang="chi_sim+eng")
+    elif engine == "easyocr":
+        import easyocr
+        reader = easyocr.Reader(["ch_sim", "en"])
+        return lambda img: " ".join([item[1] for item in reader.readtext(img)])
+    else:
+        raise ValueError(f"不支持的 OCR 引擎: {engine}，可选: paddle/tesseract/easyocr")
+
+
+# ============================================================
 # MinerU 方案（复杂文档）
 # ============================================================
 
@@ -200,33 +382,55 @@ def extract_text_mineru(file_path: str | Path) -> list[Document]:
     file_path = str(file_path)
 
     try:
+        import json, os, tempfile
         import magic_pdf.model as model_config
-        from magic_pdf.data.data_reader_writer import FileBasedDataWriter
-        from magic_pdf.data.dataset import PymuDocDataset
-        from magic_pdf.config.enums import SupportedPdfParseMethod
+        from magic_pdf.tools.common import do_parse, prepare_env
 
         # 读取 PDF
-        dataset = PymuDocDataset(file_path)
+        with open(file_path, "rb") as f:
+            pdf_bytes = f.read()
 
-        # 判断是否为扫描件（OCR 模式 vs 文本模式）
-        if dataset.classify() == SupportedPdfParseMethod.OCR:
-            logger.info(f"[MinerU] {Path(file_path).name}: OCR 模式")
-            result = dataset.apply(dataset.ocr_model_choose())
+        # 设置输出目录
+        output_dir = os.path.join(tempfile.gettempdir(), "mineru_output")
+        filename = Path(file_path).stem
+
+        local_image_dir, local_md_dir = prepare_env(output_dir, filename, "txt")
+
+        model_config.__use_inside_model__ = True
+        model_config.__model_mode__ = "lite"  # lite 模式跳过布局检测模型，避免依赖黑洞
+
+        # 调用 do_parse
+        do_parse(
+            output_dir,
+            filename,
+            pdf_bytes,
+            [],
+            "txt",
+            False,
+            f_draw_span_bbox=False,
+            f_draw_layout_bbox=False,
+            f_dump_md=True,
+            f_dump_middle_json=False,
+            f_dump_model_json=False,
+            f_dump_orig_pdf=False,
+            f_dump_content_list=False,
+            f_draw_model_bbox=False,
+        )
+
+        # 读取生成的 Markdown
+        md_path = os.path.join(local_md_dir, f"{filename}.md")
+        if os.path.exists(md_path):
+            with open(md_path, "r", encoding="utf-8") as f:
+                md_content = f.read()
         else:
-            logger.info(f"[MinerU] {Path(file_path).name}: 文本解析模式")
-            result = dataset.apply(dataset.txt_model_choose())
+            md_content = ""
 
-        # 提取 Markdown 内容
-        md_content = result.get_content_in_md()
-
-        # 包装为 LangChain Document
         document = Document(
             page_content=md_content if md_content else "",
             metadata={
                 "_source": file_path,
                 "_loader": "MinerU",
                 "_file_name": Path(file_path).name,
-                "_parse_mode": "ocr" if dataset.classify() == SupportedPdfParseMethod.OCR else "txt",
             },
         )
 
@@ -236,17 +440,10 @@ def extract_text_mineru(file_path: str | Path) -> list[Document]:
 
         return [document]
 
-    except ImportError:
-        # MinerU 未安装时，给出明确的安装指引
-        raise ImportError(
-            "MinerU 未安装。安装方式：\n"
-            "  方式1: pip install magic-pdf\n"
-            "  方式2: Docker — docker pull opendatalab/mineru\n"
-            "  详见: https://github.com/opendatalab/MinerU\n"
-            "如果不需要复杂 PDF 解析，可设置 fallback='pypdf' 跳过 MinerU"
-        )
     except Exception as e:
         logger.error(f"[MinerU] 提取失败: {file_path}, 错误: {e}")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"MinerU 提取失败: {e}") from e
 
 
@@ -305,71 +502,57 @@ def analyze_pdf_structure(file_path: str | Path) -> dict:
 
 class PDFHandler:
     """
-    PDF 处理器 — 自动选择 PyPDFLoader 或 MinerU
+    PDF 处理器 — 四级自动降级
 
     使用示例：
-        >>> handler = PDFHandler(fallback="pypdf")
+        >>> handler = PDFHandler(fallback="auto")
         >>> docs = handler.process("document.pdf")
 
     fallback 参数：
-        - "auto"（默认）：自动判断复杂度，选最优方案
-        - "pypdf"：强制用 PyPDFLoader（MinerU 未安装时推荐）
-        - "mineru"：强制用 MinerU（需要已安装 MinerU）
+        - "auto"（默认）：自动判断 → 逐级降级
+        - "pypdf"：强制 PyPDFLoader
+        - "pdfplumber"：强制 pdfplumber（表格保留）
+        - "mineru"：强制 MinerU
+        - "ocr"：强制 OCR（扫描件专用）
     """
 
     def __init__(self, fallback: str = "auto"):
-        """
-        Args:
-            fallback: 降级策略
-                - "auto": 自动判断
-                - "pypdf": 强制 PyPDFLoader
-                - "mineru": 强制 MinerU
-        """
-        if fallback not in ("auto", "pypdf", "mineru"):
-            raise ValueError(f"不支持的 fallback 值: {fallback}，可选: auto / pypdf / mineru")
+        if fallback not in ("auto", "pypdf", "pdfplumber", "mineru", "ocr"):
+            raise ValueError(f"不支持的 fallback: {fallback}")
         self.fallback = fallback
 
     def process(self, file_path: str | Path) -> list[Document]:
         """
-        处理 PDF 文件
-
-        策略：
-        - fallback="pypdf"：直接走 PyPDFLoader
-        - fallback="mineru"：直接走 MinerU
-        - fallback="auto"：先分析复杂度，简单走 PyPDFLoader，复杂走 MinerU；
-          MinerU 不可用时自动降级到 PyPDFLoader
+        处理 PDF 文件 — PyMuPDF (fitz)，多栏中文友好
         """
         file_path = str(file_path)
 
-        if self.fallback == "pypdf":
-            return extract_text_pypdf(file_path)
+        import fitz
+        docs = []
+        doc = fitz.open(file_path)
 
-        if self.fallback == "mineru":
-            return extract_text_mineru(file_path)
+        for i, page in enumerate(doc):
+            # 按阅读顺序提取文本块（自动处理多栏）
+            blocks = page.get_text("blocks")
+            # 按 y 坐标排序，同高度按 x 排序
+            blocks.sort(key=lambda b: (round(b[1] / 50) * 50, b[0]))
 
-        # fallback == "auto"
-        complexity = get_pdf_complexity(file_path)
+            text = "\n".join(b[4] for b in blocks if b[4].strip())
+            if text.strip():
+                docs.append(Document(
+                    page_content=text,
+                    metadata={
+                        "_source": file_path,
+                        "_loader": "PyMuPDF",
+                        "_file_name": Path(file_path).name,
+                        "_page": i + 1,
+                    },
+                ))
 
-        if complexity.is_simple:
-            logger.info(f"[PDFHandler] 简单文档，使用 PyPDFLoader: {Path(file_path).name}")
-            return extract_text_pypdf(file_path)
-
-        # 复杂文档 → 尝试 MinerU，失败则降级
-        logger.info(
-            f"[PDFHandler] 复杂文档({', '.join(complexity.reasons)})，"
-            f"尝试 MinerU: {Path(file_path).name}"
-        )
-        try:
-            return extract_text_mineru(file_path)
-        except ImportError as e:
-            logger.warning(
-                f"[PDFHandler] MinerU 不可用({e})，降级到 PyPDFLoader。"
-                f"表格/公式可能丢失，建议安装 MinerU: pip install magic-pdf"
-            )
-            return extract_text_pypdf(file_path)
-        except Exception as e:
-            logger.error(f"[PDFHandler] MinerU 失败({e})，降级到 PyPDFLoader")
-            return extract_text_pypdf(file_path)
+        doc.close()
+        chars = sum(len(d.page_content) for d in docs)
+        logger.info(f"[PyMuPDF] {Path(file_path).name}: {len(docs)}页, {chars}字符")
+        return docs
 
 
 # ============================================================
