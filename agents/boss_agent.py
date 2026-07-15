@@ -18,7 +18,7 @@ Author: 程响
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -113,8 +113,7 @@ class BossAgent:
         workflow.add_edge("react", "supervisor")
         workflow.add_edge("plan_execute", "supervisor")
 
-        import os; os.makedirs("data", exist_ok=True)
-        return workflow.compile(checkpointer=SqliteSaver.from_conn_string("data/checkpoints.db"))
+        return workflow.compile(checkpointer=MemorySaver())
 
     async def _call_supervisor(self, state: BossState):
         messages = [SystemMessage(content=BOSS_PROMPT)] + list(state["messages"])
@@ -201,4 +200,11 @@ class BossAgent:
 
 
 # 全局单例
-boss_agent = BossAgent()
+# 全局单例（延迟加载）
+_boss_agent = None
+
+def get_boss_agent():
+    global _boss_agent
+    if _boss_agent is None:
+        _boss_agent = BossAgent()
+    return _boss_agent

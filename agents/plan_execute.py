@@ -23,7 +23,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -287,12 +287,13 @@ class PlanExecuteAgent:
         answer = await agent.ainvoke("核心交换机 CPU 飙到 95%，排查")
     """
 
-    def __init__(self):
+    def __init__(self, tools: list = None, checkpointer=None):
         self.llm = get_chat_model(temperature=0.0, streaming=False)
-        self.tools = list(DEFAULT_TOOLS)
+        self.tools = list(tools) if tools else list(DEFAULT_TOOLS)
         self.intent = DEFAULT_INTENT
+        self._checkpointer = checkpointer  # None → MemorySaver
         self.graph = self._build_graph()
-        logger.info("[PlanExecuteAgent] 初始化完成 (Planner + Executor + Replanner)")
+        logger.info(f"[PlanExecuteAgent] 初始化完成 (Planner + Executor + Replanner), tools={len(self.tools)}")
 
     def _build_graph(self):
         workflow = StateGraph(PlanExecuteState)
@@ -306,8 +307,9 @@ class PlanExecuteAgent:
             "executor": "executor",
             END: END,
         })
-        import os; os.makedirs("data", exist_ok=True)
-        return workflow.compile(checkpointer=SqliteSaver.from_conn_string("data/checkpoints.db"))
+        return workflow.compile(
+            checkpointer=self._checkpointer or MemorySaver()
+        )
 
     # ─── Planner ───
 
@@ -493,4 +495,11 @@ class PlanExecuteAgent:
 
 
 # 全局单例
-plan_execute_agent = PlanExecuteAgent()
+# 全局单例（延迟加载）
+_plan_execute_agent = None
+
+def get_plan_execute_agent():
+    global _plan_execute_agent
+    if _plan_execute_agent is None:
+        _plan_execute_agent = PlanExecuteAgent()
+    return _plan_execute_agent

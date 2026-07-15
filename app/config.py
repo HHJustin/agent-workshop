@@ -23,7 +23,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """全局配置"""
+    """全局配置 — .env + 可选 TOML 文件（多环境支持）"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -32,9 +32,52 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def load(cls, env: str = "") -> "Settings":
+        """
+        加载配置：TOML 文件 → .env → 环境变量（优先级递增）
+
+        用法:
+            config = Settings.load()           # 自动检测 APP_ENV
+            config = Settings.load("dev")      # 强制 dev
+            config = Settings.load("prod")     # 强制 prod
+        """
+        import os, sys, tomllib
+
+        # 确定配置文件
+        app_env = env or os.getenv("APP_ENV", "dev")
+        candidates = [
+            f"config.{app_env}.toml",
+            "config.toml",
+        ]
+
+        toml_data = {}
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        toml_data = tomllib.load(f)
+                    break
+                except Exception:
+                    pass
+
+        # TOML 值作为初始值，.env 和环境变量会覆盖
+        if toml_data:
+            for key, val in toml_data.items():
+                if isinstance(val, dict):
+                    # 展平嵌套: {llm: {model: xxx}} → LLM_MODEL
+                    for sub_key, sub_val in val.items():
+                        env_key = f"{key}_{sub_key}".upper()
+                        os.environ.setdefault(env_key, str(sub_val))
+                else:
+                    os.environ.setdefault(key.upper(), str(val))
+
+        return cls()
+
     # ==================== 应用配置 ====================
     app_name: str = "Agent Workshop"
     app_version: str = "1.0.0"
+    app_env: str = "dev"           # dev / prod
     debug: bool = True
     host: str = "0.0.0.0"
     port: int = 9900
@@ -80,6 +123,11 @@ class Settings(BaseSettings):
     agent_retry_base_delay: float = 1.0  # 重试基础延迟（秒）
     agent_tool_execution: Literal["parallel", "sequential"] = "parallel"
 
+    # ==================== TurnGuard 配置 ====================
+    agent_max_seconds: int = 120     # 单轮最长执行时间（秒）
+    agent_max_llm_calls: int = 10    # 单轮最多 LLM 调用次数
+    agent_max_tool_errors: int = 5   # 单轮最多工具错误次数
+
     # ==================== 会话配置 ====================
     session_db_path: str = "data/chat_history.db"   # AsyncSqliteSaver
 
@@ -124,8 +172,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["*"]
 
 
-# 全局单例
-config = Settings()
+# 全局单例（自动检测 APP_ENV，默认 dev）
+config = Settings.load()
 
 # ChatQwen 需要环境变量
 import os

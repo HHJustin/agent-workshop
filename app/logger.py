@@ -22,13 +22,13 @@ def setup_logger():
     # 移除默认 handler
     logger.remove()
 
-    # 通道1：控制台（INFO 以上，带颜色）
+    # 通道1：控制台（精简格式）
     logger.add(
         sys.stdout,
         format=(
             "<green>{time:HH:mm:ss}</green> | "
             "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
             "<level>{message}</level>"
         ),
         level="DEBUG" if config.debug else "INFO",
@@ -37,7 +37,7 @@ def setup_logger():
         diagnose=config.debug,
     )
 
-    # 通道2：文件（DEBUG 以上，按天轮转，自动压缩）— 含 trace_id
+    # 通道2：文件 — 结构化字段（trace_id / intent / step），缺省显示 -
     logger.add(
         f"{config.log_dir}/app_{{time:YYYY-MM-DD}}.log",
         rotation="00:00",
@@ -48,15 +48,27 @@ def setup_logger():
         backtrace=True,
         diagnose=True,
         level="DEBUG",
-        format=lambda record: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {tid:<12} | {name}:{function}:{line} | {message}".format(
+        format=lambda record: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | tid={tid} | intent={intent} | step={step} | {name}:{function} | {message}".format(
             time=record["time"], level=record["level"].name,
-            tid=record["extra"].get("trace_id", "-") or "-",
+            tid=record["extra"].get("trace_id", "-"),
+            intent=record["extra"].get("intent", "-"),
+            step=record["extra"].get("step", "-"),
             name=record["name"], function=record["function"],
-            line=record["line"], message=record["message"],
+            message=record["message"],
         ),
     )
 
-    logger.info(f"[Logger] 日志系统就绪, level={config.log_level}, dir={config.log_dir}")
+
+# ─── 结构化日志辅助 ───
+
+def get_trace_logger(trace_id: str = "-", intent: str = "-"):
+    """获取绑定了 trace_id + intent 的 logger，全链路追踪"""
+    return logger.bind(trace_id=trace_id, intent=intent, step="-")
+
+
+def log_step(log, step: str, message: str, **kwargs):
+    """记录一个步骤事件"""
+    log.bind(step=step).info(message, **kwargs)
 
 
 # 模块导入时自动初始化

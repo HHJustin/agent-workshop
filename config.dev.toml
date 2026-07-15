@@ -1,0 +1,17 @@
+# Agent Workshop — 开发环境配置
+# APP_ENV=dev 时自动加载
+
+[app]
+debug = true
+log_level = "DEBUG"
+
+[llm]
+model = "qwen-max"
+provider = "dashscope"
+
+[agent]
+max_steps = 8
+max_retries = 3
+max_seconds = 120
+max_llm_calls = 10
+max_tool_errors = 5

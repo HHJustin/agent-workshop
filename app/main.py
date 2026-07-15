@@ -9,7 +9,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,9 +32,17 @@ async def lifespan(app: FastAPI):
     logger.info(f"[启动] {config.app_name} v{config.app_version}")
     logger.info(f"[启动] LLM: {config.llm_provider}/{config.llm_model}")
     logger.info(f"[启动] Vector: {config.vector_store}")
+    logger.info(f"[启动] Env: {config.app_env}")
     logger.info(f"[启动] http://{config.host}:{config.port}")
     logger.info("=" * 50)
+
+    # 启动后台定时任务
+    from app.scheduler import start_scheduler, stop_scheduler
+    start_scheduler()
+
     yield
+
+    stop_scheduler()
     logger.info(f"[关闭] {config.app_name} 已停止")
 
 
@@ -75,6 +83,7 @@ class CompactionTestRequest(BaseModel):
 # ============================================================
 
 _active_streams: dict[str, asyncio.Event] = {}
+_session_locks: dict[str, asyncio.Lock] = {}
 
 
 # ============================================================
@@ -111,9 +120,8 @@ async def chat_test(req: ChatRequest):
 @app.post("/api/agent")
 async def agent_chat(req: AgentRequest):
     """非流式 Agent 对话"""
-    from agents.react_agent import react_agent
-    answer = await react_agent.ainvoke(req.question, req.session_id)
-    react_agent._save_messages(req.session_id, req.question, answer)
+    from agents.master_agent import master_agent
+    answer = await master_agent.ainvoke(req.question, req.session_id)
     return {"status": "ok", "question": req.question, "answer": answer}
 
 
@@ -121,41 +129,45 @@ async def agent_chat(req: AgentRequest):
 @rate_limited
 async def agent_chat_stream(req: AgentRequest, request: Request):
     """流式 Agent 对话 — SSE（支持主动停止，有限流保护）"""
-    from agents import intent_router
-    from agents.react_agent import react_agent
+    # 会话级并发锁：同一会话同时只能有一个请求在执行
+    lock = _session_locks.setdefault(req.session_id, asyncio.Lock())
+    if lock.locked():
+        raise HTTPException(status_code=429, detail="请等待上一条消息处理完成")
+    async with lock:
+        return await _agent_chat_stream_impl(req, request)
 
-    # 始终先检测用户意图
+
+async def _agent_chat_stream_impl(req: AgentRequest, request: Request):
+    """agent_chat_stream 的内部实现（由会话锁保护）"""
+    from agents.master_agent import master_agent
+
+    # 意图检测（用于日志 + trace，MasterAgent 内部也会做一次路由）
+    from agents import intent_router
     route_result = await intent_router.route(req.question)
     actual_intent = route_result.intent
     logger.info(f"[IntentRouter] {req.question[:30]}... → intent={actual_intent}")
 
-    # Agent 模式选择
-    # PlanExecute/Supervisor 只在诊断场景生效，QA/Report 强制用 ReAct
-    req.agent_mode = actual_intent
-
+    # Agent 选择：默认 MasterAgent，URL 参数可切到旧版（面试对比用）
     if req.agent_mode == "supervisor":
-        from agents.supervisor import supervisor_agent
-        agent = supervisor_agent
+        from agents.supervisor import get_supervisor_agent
+        agent = get_supervisor_agent()
+        req.agent_mode = "supervisor"
     elif req.agent_mode == "plan_execute":
-        from agents.plan_execute import plan_execute_agent
-        agent = plan_execute_agent
+        from agents.plan_execute import get_plan_execute_agent
+        agent = get_plan_execute_agent()
+        req.agent_mode = "plan_execute"
     elif req.agent_mode == "boss":
-        from agents.boss_agent import boss_agent
-        agent = boss_agent
-    elif actual_intent == "diagnosis":
-        # diagnosis → PlanExecute（诊断场景直接用深度模式）
-        complex_keywords = ["排查", "诊断", "分析", "告警", "故障", "异常", "报错",
-                            "CPU", "内存", "磁盘", "网络", "重启", "宕机",
-                            "全面排查", "根因分析", "综合分析", "彻底排查"]
-        if any(kw in req.question for kw in complex_keywords):
-            from agents.plan_execute import plan_execute_agent
-            agent = plan_execute_agent
-            req.agent_mode = "plan_execute"
-            logger.info(f"[AutoRoute] 复杂诊断 → PlanExecute")
-        else:
-            agent = react_agent
+        from agents.boss_agent import get_boss_agent
+        agent = get_boss_agent()
+        req.agent_mode = "boss"
+    elif req.agent_mode == "react":
+        from agents.react_agent import get_react_agent
+        agent = get_react_agent()
+        req.agent_mode = "react"
     else:
-        agent = react_agent  # qa/report → ReAct
+        # 默认：MasterAgent（内置路由 + 工具隔离 + 流式）
+        agent = master_agent
+        req.agent_mode = actual_intent
 
     logger.info(f"[Route] {req.question[:30]}... → agent={type(agent).__name__}, intent={actual_intent}")
 
@@ -312,16 +324,16 @@ async def get_trace_detail(trace_id: str):
 @app.get("/api/sessions")
 async def list_sessions():
     """获取历史会话列表"""
-    from agents.react_agent import react_agent
-    sessions = await react_agent.list_sessions()
+    from agents.react_agent import get_react_agent
+    sessions = await get_react_agent().list_sessions()
     return {"status": "ok", "sessions": sessions}
 
 
 @app.get("/api/session/{session_id}")
 async def get_session(session_id: str):
     """获取指定会话的历史消息"""
-    from agents.react_agent import react_agent
-    history = await react_agent.get_session_history(session_id)
+    from agents.react_agent import get_react_agent
+    history = await get_react_agent().get_session_history(session_id)
     return {"status": "ok", "session_id": session_id, "messages": history, "count": len(history)}
 
 
@@ -343,10 +355,11 @@ async def list_documents():
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
     """删除指定会话历史"""
-    from agents.react_agent import react_agent
-    if hasattr(react_agent, "_sessions"):
-        react_agent._sessions.pop(session_id, None)
-        react_agent._save_sessions()
+    from agents.react_agent import get_react_agent
+    ra = get_react_agent()
+    if hasattr(ra, "_sessions"):
+        ra._sessions.pop(session_id, None)
+        ra._save_sessions()
     # 同时删除该会话上传的文档索引
     from retrieval.vector_store import vector_store_manager
     vector_store_manager.delete_by_source(f"session:{session_id}")

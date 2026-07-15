@@ -18,7 +18,7 @@ Author: 程响
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import config
 from app.llm_factory import get_chat_model
@@ -117,8 +117,8 @@ class ReactAgent:
             return
         import os, json
         os.makedirs("data", exist_ok=True)
-        os.makedirs("data", exist_ok=True)
-        self.checkpointer = SqliteSaver.from_conn_string("data/checkpoints.db")
+        from .checkpoint import get_checkpointer
+        self.checkpointer = await get_checkpointer()
 
         # 加载 MCP 远程工具（独立进程，动态发现）
         from mcp_tools.mcp_client import mcp_manager
@@ -133,7 +133,7 @@ class ReactAgent:
         self._data_file = "data/sessions.json"
         self._sessions: dict = self._load_sessions()
         self._initialized = True
-        logger.info(f"[ReactAgent] SqliteSaver + JSON 持久化就绪 (本地{len(self.tools)}个 + MCP远程{len(mcp_tools)}个)")
+        logger.info(f"[ReactAgent] MemorySaver + JSON 持久化就绪 (本地{len(self.tools)}个 + MCP远程{len(mcp_tools)}个)")
 
     def _load_sessions(self) -> dict:
         import json, os
@@ -167,7 +167,7 @@ class ReactAgent:
             msgs = self._sessions[session_id].get("messages", [])
             if msgs:
                 return msgs
-        # 再查 SqliteSaver
+        # 再查 MemorySaver
         config = {"configurable": {"thread_id": session_id}}
         try:
             checkpoint = self.checkpointer.get_tuple(config)
@@ -305,5 +305,11 @@ class ReactAgent:
         return ""
 
 
-# 全局单例
-react_agent = ReactAgent()
+# 全局单例（延迟加载）
+_react_agent = None
+
+def get_react_agent():
+    global _react_agent
+    if _react_agent is None:
+        _react_agent = ReactAgent()
+    return _react_agent

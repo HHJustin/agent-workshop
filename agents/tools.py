@@ -1,19 +1,13 @@
 """
 共享工具集 — 三种 Agent 模式共用同一套工具
 
-面试考点：
-    Q: "Function Calling 原理？参数错误怎么处理？"
-    A: LLM 根据 tools 参数的 JSON Schema 判断是否调工具。
-       参数错误时用 try/except 捕获，把错误信息返回给 LLM 让它自我纠正。
-
 会话隔离：
-    使用 contextvars 传递 session_id，检索时自动过滤当前会话的文档。
-    新会话看不到旧会话上传的文档。
+    通过 ToolContext (contextvars) 传递上下文，
+    retrieve_knowledge 检索时自动过滤当前会话的文档。
 
 Author: 程响
 """
 
-import contextvars
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -22,18 +16,13 @@ from langchain_core.tools import tool
 from app.config import config
 from app.logger import logger
 
-# 会话上下文（工具调用时自动获取当前会话ID）
-_current_session: contextvars.ContextVar[str] = contextvars.ContextVar("session_id", default="")
-
-
-def set_current_session(session_id: str):
-    """设置当前会话上下文（Agent 调用工具前设置）"""
-    _current_session.set(session_id)
+# 复用统一的 ToolContext（兼容旧版 API）
+from .context import set_current_session, get_current_context as _get_ctx
 
 
 def get_current_session() -> str:
-    """获取当前会话上下文"""
-    return _current_session.get()
+    """获取当前会话ID（从 ToolContext 中提取）"""
+    return _get_ctx().session_id
 
 
 # ==================== 知识检索工具 ====================

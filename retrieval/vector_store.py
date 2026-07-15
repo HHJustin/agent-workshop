@@ -368,9 +368,9 @@ class VectorStoreManager:
 
     @property
     def is_healthy(self) -> bool:
-        """健康检查"""
+        """健康检查 — 验证 Milvus 连通性 + Collection 可用"""
         try:
-            # 简单测试：搜一个不可能命中的词
+            self._ensure_initialized()  # 懒初始化
             self._vector_store.similarity_search("__health_check__", k=1)
             return True
         except Exception:

@@ -1,0 +1,17 @@
+# Agent Workshop — 生产环境配置
+# APP_ENV=prod 时自动加载
+
+[app]
+debug = false
+log_level = "INFO"
+
+[llm]
+model = "qwen-max"
+provider = "dashscope"
+
+[agent]
+max_steps = 8
+max_retries = 2
+max_seconds = 180
+max_llm_calls = 15
+max_tool_errors = 3
