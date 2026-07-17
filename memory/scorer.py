@@ -39,19 +39,25 @@ async def score_importance(content: str) -> dict:
     try:
         import json
         llm = get_chat_model(model="qwen-turbo", temperature=0.0, streaming=False)
-        response = await llm.ainvoke(IMPORTANCE_PROMPT.format(content=content[:1000]))
+        # 字符串拼接替代 .format()，避免 content 中的 { } 导致 KeyError
+        prompt = IMPORTANCE_PROMPT.replace("{content}", content[:1000])
+        response = await llm.ainvoke(prompt)
         text = response.content if hasattr(response, "content") else str(response)
+        if isinstance(text, list):
+            text = " ".join(str(t) for t in text)
 
-        # 解析 JSON（LLM 可能输出多余文字）
+        # 解析 JSON
         start = text.find("{")
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
             result = json.loads(text[start:end])
-            result.setdefault("score", 0)
-            result.setdefault("summary", "")
-            result.setdefault("keywords", "")
-            result.setdefault("reason", "")
-            return result
+            if isinstance(result, dict):
+                return {
+                    "score": int(result.get("score", 0)),
+                    "summary": str(result.get("summary", "")),
+                    "keywords": str(result.get("keywords", "")),
+                    "reason": str(result.get("reason", "")),
+                }
     except Exception as e:
         logger.warning(f"[MemoryScorer] 评估失败: {e}")
 

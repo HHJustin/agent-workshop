@@ -152,21 +152,27 @@ class DashScopeEmbeddings(Embeddings):
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量嵌入文档"""
+        """批量嵌入文档（DashScope 单次最多 20 条，自动分批）"""
         if not texts:
             return []
-        # 过滤空字符串
         texts = [t for t in texts if t and t.strip()]
         if not texts:
             return []
         logger.info(f"[Embedding] 批量嵌入 {len(texts)} 个文档")
-        response = self.client.embeddings.create(
-            model=self.model,
-            input=texts,
-            dimensions=self.dimensions,
-            encoding_format="float",
-        )
-        return [item.embedding for item in response.data]
+
+        BATCH_SIZE = 10  # DashScope embedding API 单次最多 10 条
+        all_embeddings = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i:i + BATCH_SIZE]
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=batch,
+                dimensions=self.dimensions,
+                encoding_format="float",
+            )
+            all_embeddings.extend(item.embedding for item in response.data)
+
+        return all_embeddings
 
     def embed_query(self, text: str) -> list[float]:
         """嵌入单个查询"""

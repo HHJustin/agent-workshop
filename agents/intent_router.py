@@ -73,8 +73,9 @@ FAST_ROUTES: dict[str, tuple[list[str], float]] = {
     ),
     "diagnosis": (
         ["告警", "故障", "异常", "报错", "超时", "宕机", "挂了", "不通",
-         "延迟", "丢包", "重启", "连接失败", "502", "503", "500",
-         "CPU", "内存", "磁盘", "网络中断", "不可用", "排查", "诊断"],
+         "丢包", "重启", "连接失败", "网络中断", "不可用",
+         "CPU飙", "CPU 飙", "内存耗尽", "磁盘满了", "排查", "诊断",
+         "flapping", "IDLE", "Idle"],  # 移除 502/503/500（HTTP 状态码属 QA），移除裸 CPU/内存/磁盘（太泛）
         0.90,
     ),
     "qa": (
@@ -83,25 +84,75 @@ FAST_ROUTES: dict[str, tuple[list[str], float]] = {
          "步骤", "教程", "指南", "文档", "手册", "帮助",
          "详细介绍", "详细描述", "请介绍", "请描述", "请说明",
          "讲一下", "说说", "聊聊", "展示", "列举", "列出来",
-         "写一下", "写一个", "介绍一下"],
+         "写一下", "写一个", "介绍一下",
+         "HTTP", "状态码", "区别", "概念", "定义", "意思", "含义",
+         "怎么排查", "如何排查", "怎样排查", "如何诊断"],  # 长短语优先于 diagnosis 的"排查"
         0.85,
     ),
 }
 
 
 def _keyword_match(query: str) -> Optional[Intent]:
-    """关键词快速匹配，命中则直接返回，不走 LLM"""
+    """关键词快速匹配，收集所有命中，处理冲突后返回"""
     query_lower = query.lower()
+
+    # 收集所有命中
+    hits: list[tuple[str, str, float]] = []  # (intent, keyword, confidence)
     for intent_name, (keywords, confidence) in FAST_ROUTES.items():
         for kw in keywords:
             if kw.lower() in query_lower:
-                logger.info(f"[IntentRouter] 关键词命中: '{kw}' → intent={intent_name}")
-                return Intent(
-                    intent=intent_name,
-                    confidence=confidence,
-                    reason=f"关键词匹配: {kw}",
-                )
-    return None
+                hits.append((intent_name, kw, confidence))
+
+    if not hits:
+        return None
+
+    # 只有一个命中 → 直接返回
+    if len(hits) == 1:
+        intent_name, kw, confidence = hits[0]
+        logger.info(f"[IntentRouter] 关键词命中: '{kw}' → intent={intent_name}")
+        return Intent(intent=intent_name, confidence=confidence, reason=f"关键词匹配: {kw}")
+
+    # 多个命中 → 冲突解决
+    intents = {h[0] for h in hits}
+
+    # project_intro 优先级最高
+    if "project_intro" in intents:
+        h = next(h for h in hits if h[0] == "project_intro")
+        logger.info(f"[IntentRouter] 多命中→project_intro 优先: {[h[1] for h in hits]}")
+        return Intent(intent="project_intro", confidence=0.95, reason=f"多关键词命中，project_intro 优先")
+
+    # QA vs Diagnosis 冲突 → 检查是否是知识问答句式
+    if "qa" in intents and "diagnosis" in intents:
+        question_patterns = ["什么是", "怎么", "如何", "区别", "为什么", "介绍一下",
+                            "http", "状态码", "意思", "含义", "定义", "概念"]
+        # 长 QA 短语（3字+）算 2 个信号
+        qa_signals = sum(1 for p in question_patterns if p in query_lower)
+        qa_long_phrases = sum(1 for h in hits if h[0] == "qa" and len(h[1]) >= 3)
+        qa_signals += qa_long_phrases  # 每个长短语 +1 信号
+        diag_signals = sum(1 for h in hits if h[0] == "diagnosis")
+
+        if qa_signals >= 2:
+            logger.info(f"[IntentRouter] QA/Diagnosis 冲突→QA（知识句式: {qa_signals} 个信号）")
+            return Intent(intent="qa", confidence=0.80,
+                         reason=f"QA/Diagnosis 冲突，知识句式信号={qa_signals}")
+        if diag_signals >= 2:
+            logger.info(f"[IntentRouter] QA/Diagnosis 冲突→Diagnosis（{diag_signals} 个诊断关键词）")
+            return Intent(intent="diagnosis", confidence=0.80,
+                         reason=f"QA/Diagnosis 冲突，诊断信号={diag_signals}")
+
+        # 无法判断 → 降级到 L2
+        logger.info(f"[IntentRouter] QA/Diagnosis 冲突无法判断，升级到 L2")
+        return None
+
+    # Report vs QA 冲突 → report 优先
+    if "report" in intents:
+        h = next(h for h in hits if h[0] == "report")
+        return Intent(intent="report", confidence=0.90, reason="report 关键词命中")
+
+    # 其余：取置信度最高的
+    best = max(hits, key=lambda h: h[2])
+    logger.info(f"[IntentRouter] 多命中→取最高置信度: '{best[1]}' → intent={best[0]}")
+    return Intent(intent=best[0], confidence=best[2], reason=f"多关键词匹配: {best[1]}")
 
 
 # ============================================================
