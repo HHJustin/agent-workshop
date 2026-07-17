@@ -180,6 +180,48 @@ class MasterAgent:
             "query": query, "session_id": session_id, "intent": intent,
         })
 
+        # Step 0: 检查是否触发 Skill — 优先级最高，命中则跳过常规路由
+        skill_spec = _match_skill(query)
+        if skill_spec:
+            skill_prompt, skill_tool_names = skill_spec.inject()
+            skill_tools = _resolve_tools(skill_tool_names)
+            logger.info(f"[MasterAgent] Skill触发: {skill_spec.name} ({skill_spec.trigger_keywords})")
+            logger.info(f"[MasterAgent] Skill工具: {skill_tool_names} (解析为{len(skill_tools)}个)")
+
+            guard = TurnGuard(session_id=session_id)
+            # 按 Skill 的工具集创建临时 Agent
+            skill_agent = create_agent(
+                model=get_chat_model(temperature=0.1, streaming=True),
+                tools=skill_tools,
+                system_prompt=skill_prompt,
+            )
+            config_dict = {"configurable": {"thread_id": session_id}}
+            async for token, metadata in skill_agent.astream(
+                {"messages": [
+                    SystemMessage(content=skill_prompt),
+                    HumanMessage(content=query),
+                ]},
+                config=config_dict, stream_mode="messages",
+            ):
+                msg_type = type(token).__name__
+                if hasattr(token, "tool_calls") and token.tool_calls:
+                    for tc in token.tool_calls:
+                        yield {"type": "tool_call", "tool": tc.get("name", "unknown"),
+                               "args": str(tc.get("args", {}))[:120]}
+                    continue
+                if msg_type == "ToolMessage":
+                    yield {"type": "tool_result", "tool": getattr(token, "name", "unknown"),
+                           "preview": str(token.content)[:200] if token.content else ""}
+                    continue
+                if msg_type in ("AIMessageChunk", "AIMessage"):
+                    text = _extract_text(token)
+                    if text:
+                        guard.record_text()
+                        yield {"type": "text", "content": text}
+            logger.info(f"[MasterAgent] Skill完成: {skill_spec.name}")
+            await self.hooks.emit(HookEvent.AGENT_END, {"session_id": session_id})
+            return
+
         # Step 1: 内置路由（优先用外部传入的 intent）
         if intent and intent not in ("auto", "plan_execute", "supervisor", "boss", "react"):
             actual_intent = intent  # 外部已判断好的 qa/diagnosis/report
@@ -305,6 +347,49 @@ class MasterAgent:
 
 
 # ==================== 辅助函数 ====================
+
+# ─── Skill 辅助 ───
+
+_SKILL_LOADER = None
+
+
+def _match_skill(query: str):
+    """匹配 Skill，返回 SkillSpec 或 None"""
+    global _SKILL_LOADER
+    if _SKILL_LOADER is None:
+        from skills.loader import SkillLoader
+        _SKILL_LOADER = SkillLoader()
+        _SKILL_LOADER.discover()
+    return _SKILL_LOADER.match(query)
+
+
+def _resolve_tools(tool_names: list[str]) -> list:
+    """将工具名列表解析为实际工具函数列表"""
+    # 所有可用工具的名字→函数映射
+    name_map = {
+        "query_alerts": query_alerts,
+        "search_logs": search_logs,
+        "prometheus_query": prometheus_query,
+        "send_notification": send_notification,
+        "web_search": web_search,
+        "mysql_query": mysql_query,
+        "retrieve_knowledge": retrieve_knowledge,
+        "get_current_time": get_current_time,
+    }
+    # 加上 MCP 网络工具
+    for t in MCP_NETWORK_TOOLS:
+        name_map[t.name] = t
+
+    tools = []
+    for name in tool_names:
+        name = name.strip()
+        func = name_map.get(name)
+        if func:
+            tools.append(func)
+        else:
+            logger.warning(f"[Skill] 未知工具: {name}")
+    return tools
+
 
 def _get_system_prompt(intent: str) -> str:
     """按意图返回子 Agent 的 System Prompt"""

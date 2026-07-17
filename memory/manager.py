@@ -16,7 +16,7 @@ Author: 程响
 import asyncio
 from app.logger import logger
 from .scorer import should_remember
-from .store import MemoryStore
+from .store import MemoryStore, _decay_score
 from .privacy import mask_pii
 
 
@@ -63,19 +63,19 @@ class MemoryManager:
 
     def retrieve(self, user_id: str, query: str, limit: int = 5) -> list[dict]:
         """
-        混合检索：FTS5 → 回退 LIKE → 时间衰减排序
+        混合检索 + 时间衰减排序
 
         Returns:
-            [{"summary": ..., "content": ..., "importance": ..., "age_days": ...}, ...]
+            [{"summary": ..., "content": ..., "importance": ..., "age_days": ..., "decay_score": ...}, ...]
         """
         import time
+        now = time.time()
 
         try:
-            memories = self.store.search(user_id, query, limit)
+            memories = self.store.search_decay(user_id, query, limit)
         except Exception:
-            memories = self.store.search_fallback(user_id, query, limit)
+            memories = self.store.search_fallback_decay(user_id, query, limit)
 
-        now = time.time()
         return [
             {
                 "id": m.id,
@@ -84,6 +84,7 @@ class MemoryManager:
                 "keywords": m.keywords,
                 "importance": m.importance,
                 "age_days": round((now - m.created_at) / 86400, 1),
+                "decay_score": round(_decay_score(m.importance, m.created_at, now), 2),
             }
             for m in memories
         ]

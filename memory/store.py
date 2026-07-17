@@ -144,6 +144,104 @@ class MemoryStore:
         logger.info(f"[MemoryStore] 已删除用户 {user_id} 的全部记忆")
         return cur.rowcount
 
+    def search_decay(self, user_id: str, query: str, limit: int = 10,
+                     half_life_days: int = 30) -> list[MemoryEntry]:
+        """
+        FTS5 搜索 + 时间衰减排序
+
+        衰减公式: decay = 1 / (1 + age_days / half_life_days)
+        最终分数: importance × decay
+        """
+        now = time.time()
+        try:
+            rows = self.conn.execute(
+                "SELECT m.id,m.user_id,m.content,m.summary,m.keywords,"
+                "m.importance,m.source,m.created_at,m.is_deleted "
+                "FROM memories m "
+                "INNER JOIN memories_fts fts ON m.id = fts.rowid "
+                "WHERE m.user_id=? AND m.is_deleted=0 AND memories_fts MATCH ? "
+                "LIMIT 30",  # 多取一些做衰减排序
+                (user_id, _fts_sanitize(query))
+            ).fetchall()
+        except Exception:
+            rows = []
+
+        if not rows:
+            return self.search_fallback_decay(user_id, query, limit, half_life_days)
+
+        entries = [MemoryEntry(*r) for r in rows]
+        scored = [(e, _decay_score(e.importance, e.created_at, now, half_life_days))
+                  for e in entries]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [e for e, _ in scored[:limit]]
+
+    def search_fallback_decay(self, user_id: str, query: str, limit: int = 10,
+                              half_life_days: int = 30) -> list[MemoryEntry]:
+        """LIKE 回退版 + 时间衰减"""
+        now = time.time()
+        like = f"%{query}%"
+        rows = self.conn.execute(
+            "SELECT * FROM memories WHERE user_id=? AND is_deleted=0 "
+            "AND (content LIKE ? OR summary LIKE ? OR keywords LIKE ?) "
+            "ORDER BY importance DESC LIMIT 30",
+            (user_id, like, like, like)
+        ).fetchall()
+
+        entries = [MemoryEntry(*r) for r in rows]
+        scored = [(e, _decay_score(e.importance, e.created_at, now, half_life_days))
+                  for e in entries]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [e for e, _ in scored[:limit]]
+
+    def cleanup_low_importance(self, user_id: str) -> int:
+        """
+        清理低重要性过期记忆:
+          重要性 1-2 → 30 天过期
+          重要性 3   → 90 天过期
+          重要性 4-5 → 永久保留
+        """
+        now = time.time()
+        deleted = 0
+
+        # 重要性 1-2，超过 30 天
+        cursor = self.conn.execute(
+            "UPDATE memories SET is_deleted=1 "
+            "WHERE user_id=? AND is_deleted=0 AND importance <= 2 "
+            "AND (? - created_at) > 2592000",  # 30 天
+            (user_id, now)
+        )
+        deleted += cursor.rowcount
+
+        # 重要性 3，超过 90 天
+        cursor = self.conn.execute(
+            "UPDATE memories SET is_deleted=1 "
+            "WHERE user_id=? AND is_deleted=0 AND importance = 3 "
+            "AND (? - created_at) > 7776000",  # 90 天
+            (user_id, now)
+        )
+        deleted += cursor.rowcount
+
+        if deleted > 0:
+            self.conn.commit()
+            logger.info(f"[MemoryStore] 清理 {deleted} 条过期记忆 (user={user_id})")
+        return deleted
+
+    def cleanup_all_users(self) -> int:
+        """对所有用户执行低重要性清理"""
+        users = self.conn.execute(
+            "SELECT DISTINCT user_id FROM memories WHERE is_deleted=0"
+        ).fetchall()
+        total = 0
+        for (user_id,) in users:
+            total += self.cleanup_low_importance(user_id)
+        return total
+
+    def vacuum(self):
+        """回收已删除记录的空间"""
+        self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('optimize')")
+        self.conn.execute("VACUUM")
+        logger.info("[MemoryStore] VACUUM 完成")
+
     def close(self):
         """关闭数据库连接"""
         self.conn.close()
@@ -157,6 +255,13 @@ class MemoryStore:
             "SELECT AVG(importance) FROM memories WHERE user_id=? AND is_deleted=0", (user_id,)
         ).fetchone()[0] or 0
         return {"total": total, "avg_importance": round(avg_imp, 1)}
+
+
+def _decay_score(importance: int, created_at: float, now: float, half_life: int = 30) -> float:
+    """时间衰减: decay = 1 / (1 + age_days / half_life)，最终 = importance × decay"""
+    age_days = max(0, (now - created_at) / 86400)
+    decay = 1.0 / (1.0 + age_days / half_life)
+    return importance * decay
 
 
 def _fts_sanitize(query: str) -> str:

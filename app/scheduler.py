@@ -69,8 +69,23 @@ def start_scheduler():
     scheduler.add_job(cleanup_old_logs, CronTrigger(hour=3, minute=0),
                       id="log_cleanup", replace_existing=True)
 
+    # 每天凌晨 3:30 执行记忆 GC（遗忘机制）
+    scheduler.add_job(memory_gc, CronTrigger(hour=3, minute=30),
+                      id="memory_gc", replace_existing=True)
+
     scheduler.start()
-    logger.info("[Scheduler] 定时任务已启动: 健康自检(30min) + 日志清理(每天3:00)")
+    logger.info("[Scheduler] 定时任务已启动: 健康自检(30min) + 日志清理(每天3:00) + 记忆GC(每天3:30)")
+
+
+async def memory_gc():
+    """记忆垃圾回收：清理低重要性过期记忆"""
+    try:
+        from memory.gc import run_gc
+        deleted = run_gc()
+        if deleted:
+            logger.info(f"[Cron] MemoryGC: 清理 {deleted} 条过期记忆")
+    except Exception as e:
+        logger.error(f"[Cron] MemoryGC 失败: {e}")
 
 
 def stop_scheduler():
